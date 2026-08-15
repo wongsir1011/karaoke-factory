@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+work/
+outputs/*.mp4
+outputs/*.zip
+.streamlit/secrets.toml
+.vercel/
