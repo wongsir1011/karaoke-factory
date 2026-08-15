@@ -66,6 +66,7 @@ with st.container(border=True):
         key="source_choice",
     )
     youtube_url = ""
+    youtube_cookie_browser = "none"
     uploaded_video = None
     if source_choice == "YouTube 連結":
         youtube_url = st.text_input(
@@ -73,6 +74,26 @@ with st.container(border=True):
             placeholder="https://www.youtube.com/watch?v=…",
             help="只會下載單一影片，唔會下載成條播放清單。",
         )
+        with st.expander("下載有困難？", icon=":material/download_for_offline:"):
+            use_browser_cookies = st.toggle(
+                "影片要求登入時使用瀏覽器 cookies",
+                help="一般公開影片唔需要啟用。只有啟用後，程式先會讀取所選瀏覽器嘅 YouTube 登入資料。",
+            )
+            if use_browser_cookies:
+                browser_label = st.selectbox(
+                    "已登入 YouTube 嘅瀏覽器",
+                    ["Microsoft Edge", "Google Chrome", "Mozilla Firefox"],
+                )
+                youtube_cookie_browser = {
+                    "Microsoft Edge": "edge",
+                    "Google Chrome": "chrome",
+                    "Mozilla Firefox": "firefox",
+                }[browser_label]
+                st.warning(
+                    "只應喺年齡限制或 YouTube 要求登入時使用。下載過密可能令帳戶暫時受限；"
+                    "如果讀取失敗，請完全關閉所選瀏覽器後再試。",
+                    icon=":material/warning:",
+                )
     else:
         uploaded_video = st.file_uploader(
             "上載影片",
@@ -170,6 +191,7 @@ if start:
     settings = JobSettings(
         source_type=source_type,
         youtube_url=youtube_url,
+        youtube_cookie_browser=youtube_cookie_browser,
         upload_name=uploaded_video.name if uploaded_video else "",
         upload_bytes=uploaded_video.getvalue() if uploaded_video else None,
         lyrics_source=lyrics_source,
@@ -201,6 +223,9 @@ if start:
         progress.empty()
         status.update(label="製作未完成", state="error", expanded=True)
         st.error(str(exc), icon=":material/error:")
+        if exc.technical_details:
+            with st.expander("下載技術資料", icon=":material/code:"):
+                st.code(exc.technical_details, language="text")
     except Exception as exc:
         progress.empty()
         status.update(label="發生未預期錯誤", state="error", expanded=True)

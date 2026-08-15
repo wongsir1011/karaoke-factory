@@ -34,4 +34,16 @@ else {
     & $VenvPython -m pip install -r requirements.txt
 }
 
+$DenoCommand = Get-Command deno -ErrorAction SilentlyContinue
+$NodeCommand = Get-Command node -ErrorAction SilentlyContinue
+if ($DenoCommand) {
+    Write-Host "YouTube JavaScript support: Deno detected." -ForegroundColor Green
+}
+elseif ($NodeCommand) {
+    Write-Host "YouTube JavaScript support: Node.js detected." -ForegroundColor Green
+}
+else {
+    Write-Warning "YouTube downloads need Deno 2.3+ or Node.js 22+. Install one of them for reliable downloads."
+}
+
 Write-Host "Setup complete. Run .\start.ps1 to open Karaoke Factory." -ForegroundColor Green

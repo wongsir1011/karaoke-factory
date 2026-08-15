@@ -12,3 +12,8 @@ def test_app_initial_view_renders_without_exception() -> None:
     assert not app.exception
     assert app.title[0].value == "K 歌工房"
     assert app.button[0].label == "製作卡拉 OK 影片"
+    assert app.toggle[0].label == "影片要求登入時使用瀏覽器 cookies"
+
+    app.toggle[0].set_value(True).run()
+    assert not app.exception
+    assert any(item.label == "已登入 YouTube 嘅瀏覽器" for item in app.selectbox)
