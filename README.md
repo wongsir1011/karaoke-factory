@@ -45,6 +45,8 @@ AI 套件較大，而且第一次處理歌曲時會再下載 Demucs 模型。冇
 
 ## Vercel 版本
 
+正式項目頁：<https://karaoke-factory-hk.vercel.app>
+
 Vercel 部署係項目介紹及下載頁。Streamlit 需要持續 WebSocket session，而 Demucs、FFmpeg、YouTube 下載同影片重新編碼亦超出一般 Vercel Functions 嘅運行模式，因此完整製作功能保留喺 Windows 本機版，避免雲端頁面看似可用但實際處理失敗。
 
 ## 開發及測試
