@@ -6,9 +6,11 @@ import streamlit as st
 
 from karaoke_maker import (
     JobSettings,
+    LyricsLookup,
     PipelineError,
     PipelineResult,
     ai_separation_available,
+    lookup_synced_lyrics,
     run_pipeline,
 )
 
@@ -34,12 +36,21 @@ def duration_label(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+@st.cache_data(ttl="1h", max_entries=100, show_spinner=False)
+def cached_lyrics_lookup(track: str, artist: str) -> LyricsLookup:
+    return lookup_synced_lyrics(track, artist)
+
+
 st.session_state.setdefault("karaoke_result", None)
+st.session_state.setdefault("lyrics_lookup", None)
+st.session_state.setdefault("lyrics_lookup_signature", None)
+st.session_state.setdefault("lyrics_lookup_error", "")
 
 st.title("K 歌工房")
 st.caption("將你有權使用嘅 MV 變成無主唱、配有動態歌詞嘅卡拉 OK 影片。")
 
 with st.container(horizontal=True):
+    st.badge("先確認歌詞", icon=":material/lyrics:", color="green")
     st.badge("下載／上載 MV", icon=":material/video_file:", color="blue")
     st.badge("分離人聲", icon=":material/graphic_eq:", color="violet")
     st.badge("動態字幕", icon=":material/subtitles:", color="orange")
@@ -56,7 +67,98 @@ with st.sidebar:
     st.caption("成品會保存在專案嘅 `outputs` 資料夾。")
 
 with st.container(border=True):
-    st.subheader("1. 選擇 MV")
+    st.subheader("1. 先確認歌詞")
+    lyrics_choice = st.segmented_control(
+        "歌詞來源",
+        ["自動搜尋", "上載 LRC", "貼上歌詞"],
+        default="自動搜尋",
+        required=True,
+        width="stretch",
+        key="lyrics_choice",
+    )
+
+    title_col, artist_col = st.columns(2)
+    with title_col:
+        track_name = st.text_input(
+            "歌名",
+            placeholder="自動搜尋時必填",
+            key="track_name",
+        )
+    with artist_col:
+        artist_name = st.text_input(
+            "歌手",
+            placeholder="建議填寫，避免揀錯版本",
+            key="artist_name",
+        )
+
+    lyric_text = ""
+    lyrics_ready = False
+    if lyrics_choice == "自動搜尋":
+        st.caption(
+            "會先搜尋 Kugeci；搵唔到先用後備同步歌詞服務。確認成功前唔會下載影片或分離人聲。"
+            "所有中文歌詞會統一轉成香港繁體。"
+        )
+        signature = (track_name.strip().casefold(), artist_name.strip().casefold())
+        if st.session_state.lyrics_lookup_signature != signature:
+            st.session_state.lyrics_lookup = None
+            st.session_state.lyrics_lookup_error = ""
+            st.session_state.lyrics_lookup_signature = None
+
+        search_lyrics = st.button(
+            "搜尋並確認同步歌詞",
+            icon=":material/search:",
+            width="stretch",
+            disabled=not track_name.strip(),
+        )
+        if search_lyrics:
+            st.session_state.lyrics_lookup = None
+            st.session_state.lyrics_lookup_error = ""
+            with st.spinner("先到 Kugeci 搜尋同步歌詞…"):
+                try:
+                    found_lyrics = cached_lyrics_lookup(track_name, artist_name)
+                except PipelineError as exc:
+                    st.session_state.lyrics_lookup_error = str(exc)
+                else:
+                    st.session_state.lyrics_lookup = found_lyrics
+                    st.session_state.lyrics_lookup_signature = signature
+
+        lyrics_lookup: LyricsLookup | None = st.session_state.lyrics_lookup
+        if lyrics_lookup is not None and st.session_state.lyrics_lookup_signature == signature:
+            lyrics_ready = True
+            lyric_text = lyrics_lookup.lyrics
+            matched_artist = f"／{lyrics_lookup.artist}" if lyrics_lookup.artist else ""
+            st.success(
+                f"已從 {lyrics_lookup.source} 找到：{lyrics_lookup.track}{matched_artist}",
+                icon=":material/check_circle:",
+            )
+            st.link_button(
+                "查看歌詞來源",
+                lyrics_lookup.source_url,
+                icon=":material/open_in_new:",
+            )
+        elif st.session_state.lyrics_lookup_error:
+            st.error(st.session_state.lyrics_lookup_error, icon=":material/lyrics:")
+        elif not track_name.strip():
+            st.info("請先填寫歌名，再搜尋同步歌詞。", icon=":material/info:")
+    elif lyrics_choice == "上載 LRC":
+        lrc_file = st.file_uploader(
+            "LRC 歌詞檔",
+            type=["lrc", "txt"],
+            help="標準格式例如 `[00:12.50]第一句歌詞`。",
+        )
+        if lrc_file is not None:
+            lyric_text = decode_lyric_file(lrc_file.getvalue())
+            lyrics_ready = bool(lyric_text.strip())
+    else:
+        lyric_text = st.text_area(
+            "歌詞內容",
+            height=180,
+            placeholder="最好貼上有 [分鐘:秒數] 時間碼嘅 LRC；普通逐行歌詞亦可，但時間只會平均估算。",
+        )
+        lyrics_ready = bool(lyric_text.strip())
+
+with st.container(border=True):
+    st.subheader("2. 選擇 MV")
     source_choice = st.segmented_control(
         "影片來源",
         ["YouTube 連結", "本機影片"],
@@ -102,47 +204,6 @@ with st.container(border=True):
         )
 
 with st.container(border=True):
-    st.subheader("2. 準備歌詞")
-    lyrics_choice = st.segmented_control(
-        "歌詞來源",
-        ["自動搜尋", "上載 LRC", "貼上歌詞"],
-        default="自動搜尋",
-        required=True,
-        width="stretch",
-        key="lyrics_choice",
-    )
-
-    title_col, artist_col = st.columns(2)
-    with title_col:
-        track_name = st.text_input(
-            "歌名",
-            placeholder="留空會嘗試從影片讀取",
-        )
-    with artist_col:
-        artist_name = st.text_input(
-            "歌手",
-            placeholder="留空會嘗試從影片讀取",
-        )
-
-    lyric_text = ""
-    if lyrics_choice == "自動搜尋":
-        st.caption("會搜尋公開同步歌詞；填寫準確歌名同歌手可以大幅提高配對成功率。所有中文歌詞會統一轉成香港繁體。")
-    elif lyrics_choice == "上載 LRC":
-        lrc_file = st.file_uploader(
-            "LRC 歌詞檔",
-            type=["lrc", "txt"],
-            help="標準格式例如 `[00:12.50]第一句歌詞`。",
-        )
-        if lrc_file is not None:
-            lyric_text = decode_lyric_file(lrc_file.getvalue())
-    else:
-        lyric_text = st.text_area(
-            "歌詞內容",
-            height=180,
-            placeholder="最好貼上有 [分鐘:秒數] 時間碼嘅 LRC；普通逐行歌詞亦可，但時間只會平均估算。",
-        )
-
-with st.container(border=True):
     st.subheader("3. 聲音同字幕設定")
     separation_label = st.segmented_control(
         "去人聲方法",
@@ -176,14 +237,17 @@ start = st.button(
     type="primary",
     icon=":material/movie_edit:",
     width="stretch",
-    disabled=not rights_confirmed,
+    disabled=not rights_confirmed or not lyrics_ready,
 )
+
+if not lyrics_ready:
+    st.caption("請先確認自動歌詞、上載 LRC 或貼上歌詞，之後先可以開始處理影片。")
 
 if start:
     st.session_state.karaoke_result = None
     source_type = "youtube" if source_choice == "YouTube 連結" else "upload"
     lyrics_source = {
-        "自動搜尋": "auto",
+        "自動搜尋": "lrc",
         "上載 LRC": "lrc",
         "貼上歌詞": "paste",
     }[lyrics_choice]

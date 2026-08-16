@@ -4,8 +4,15 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+import karaoke_maker.pipeline as pipeline
 from karaoke_maker.lyrics import LyricLine, write_ass
 from karaoke_maker.pipeline import (
+    JobSettings,
+    LyricsLookup,
+    PipelineError,
+    _KugeciCandidate,
     _YoutubeLogger,
     _center_channel_remove,
     _extract_audio,
@@ -13,9 +20,12 @@ from karaoke_maker.pipeline import (
     _filter_escape,
     _render_video,
     _safe_filename,
+    _select_kugeci_candidate,
     _validate_youtube_url,
     _youtube_options,
     _youtube_pipeline_error,
+    lookup_synced_lyrics,
+    run_pipeline,
 )
 
 
@@ -74,6 +84,80 @@ def test_youtube_error_explains_login_requirement() -> None:
     assert "瀏覽器" in str(error)
     assert "cookies" in str(error)
     assert "not a bot" in error.technical_details
+
+
+def test_kugeci_candidate_matches_title_and_artist() -> None:
+    candidates = [
+        _KugeciCandidate("wrong", "海闊天空", "許冠傑"),
+        _KugeciCandidate("right", "海阔天空", "BEYOND"),
+    ]
+
+    result = _select_kugeci_candidate(candidates, "海闊天空", "Beyond")
+
+    assert result is not None
+    assert result.song_id == "right"
+
+
+def test_lyrics_lookup_uses_kugeci_before_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = LyricsLookup(
+        lyrics="[00:01.00]測試",
+        track="測試",
+        artist="歌手",
+        source="Kugeci",
+        source_url="https://www.kugeci.com/song/test",
+    )
+    monkeypatch.setattr(pipeline, "_fetch_kugeci_synced_lyrics", lambda *_: expected)
+
+    def unexpected_fallback(*_: object) -> None:
+        pytest.fail("LRCLIB should not be called after a Kugeci match")
+
+    monkeypatch.setattr(pipeline, "_fetch_lrclib_synced_lyrics", unexpected_fallback)
+
+    assert lookup_synced_lyrics("測試", "歌手") == expected
+
+
+def test_lyrics_lookup_falls_back_after_kugeci_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = LyricsLookup(
+        lyrics="[00:01.00]後備",
+        track="測試",
+        artist="歌手",
+        source="LRCLIB",
+        source_url="https://lrclib.net/",
+    )
+    monkeypatch.setattr(pipeline, "_fetch_kugeci_synced_lyrics", lambda *_: None)
+    monkeypatch.setattr(pipeline, "_fetch_lrclib_synced_lyrics", lambda *_: expected)
+
+    assert lookup_synced_lyrics("測試", "歌手") == expected
+
+
+def test_missing_lyrics_stops_before_youtube_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download_started = False
+
+    def fail_lookup(*_: object) -> None:
+        raise PipelineError("搵唔到歌詞")
+
+    def unexpected_download(*_: object, **__: object) -> None:
+        nonlocal download_started
+        download_started = True
+
+    monkeypatch.setattr(pipeline, "lookup_synced_lyrics", fail_lookup)
+    monkeypatch.setattr(pipeline, "_download_youtube", unexpected_download)
+
+    with pytest.raises(PipelineError, match="搵唔到歌詞"):
+        run_pipeline(
+            JobSettings(
+                source_type="youtube",
+                youtube_url="https://youtu.be/abcdefghijk",
+                lyrics_source="auto",
+                track_name="不存在歌曲",
+            )
+        )
+
+    assert download_started is False
 
 
 def test_fast_mode_and_subtitle_render_end_to_end(tmp_path: Path) -> None:

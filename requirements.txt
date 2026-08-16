@@ -2,4 +2,5 @@ streamlit==1.61.1
 yt-dlp[default]==2026.7.4
 imageio-ffmpeg==0.6.0
 requests>=2.34,<3
+truststore>=0.10,<1
 opencc-python-reimplemented==0.1.7

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import unicodedata
@@ -12,13 +13,22 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlparse
 
 import requests
+import truststore
+from requests.adapters import HTTPAdapter
 
-from .lyrics import LyricLine, lyrics_from_text, write_ass
+from .lyrics import (
+    LyricLine,
+    has_lrc_timestamps,
+    lyrics_from_text,
+    to_traditional_chinese,
+    write_ass,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -66,6 +76,22 @@ class SourceInfo:
     title: str
     artist: str
     duration: float
+
+
+@dataclass(frozen=True)
+class LyricsLookup:
+    lyrics: str
+    track: str
+    artist: str
+    source: Literal["Kugeci", "LRCLIB"]
+    source_url: str
+
+
+@dataclass(frozen=True)
+class _KugeciCandidate:
+    song_id: str
+    track: str
+    artist: str
 
 
 @dataclass(frozen=True)
@@ -440,6 +466,95 @@ def _demucs_separate(mixture: Path, instrumental: Path) -> Path:
     return instrumental
 
 
+class _NativeTrustAdapter(HTTPAdapter):
+    """Use the OS trust store while keeping certificate verification enabled."""
+
+    def init_poolmanager(self, *args: object, **kwargs: object) -> None:
+        kwargs["ssl_context"] = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        super().init_poolmanager(*args, **kwargs)
+
+    def cert_verify(
+        self,
+        conn: object,
+        url: str,
+        verify: bool | str,
+        cert: object,
+    ) -> None:
+        # Requests normally replaces the adapter context with certifi. The
+        # truststore context above already enforces hostname and CA checks via
+        # Windows CryptoAPI or the macOS Security framework.
+        if not verify:
+            raise ValueError("Native trust requests must verify TLS certificates")
+        setattr(conn, "cert_reqs", "CERT_REQUIRED")
+
+
+class _KugeciSearchParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.candidates: list[_KugeciCandidate] = []
+        self._row_links: list[tuple[str, str]] | None = None
+        self._active_href: str | None = None
+        self._active_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "tr":
+            self._row_links = []
+        elif tag == "a" and self._row_links is not None:
+            self._active_href = dict(attrs).get("href") or ""
+            self._active_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._active_href is not None:
+            self._active_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._active_href is not None:
+            text = re.sub(r"\s+", " ", "".join(self._active_text)).strip()
+            if self._row_links is not None:
+                self._row_links.append((self._active_href, text))
+            self._active_href = None
+            self._active_text = []
+        elif tag == "tr" and self._row_links is not None:
+            song_link = next(
+                (
+                    (href, text)
+                    for href, text in self._row_links
+                    if text and re.search(r"/song/[A-Za-z0-9]+/?$", href)
+                ),
+                None,
+            )
+            if song_link:
+                song_id = urlparse(song_link[0]).path.rstrip("/").rsplit("/", 1)[-1]
+                artists = [
+                    text
+                    for href, text in self._row_links
+                    if text and "/singer/" in urlparse(href).path
+                ]
+                self.candidates.append(
+                    _KugeciCandidate(
+                        song_id=song_id,
+                        track=song_link[1],
+                        artist=" ".join(dict.fromkeys(artists)),
+                    )
+                )
+            self._row_links = None
+
+
+def _native_trust_session() -> requests.Session:
+    session = requests.Session()
+    session.mount("https://", _NativeTrustAdapter())
+    return session
+
+
+def _decode_lyric_bytes(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "big5", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def _normalise_title(title: str) -> str:
     title = re.sub(r"[\[(【].*?(?:official|mv|music video|lyrics?).*?[]\)】]", "", title, flags=re.I)
     title = re.sub(r"\s+", " ", title)
@@ -458,42 +573,181 @@ def _lyric_score(item: dict[str, object], track: str, artist: str, duration: flo
     return score
 
 
-def _fetch_synced_lyrics(track: str, artist: str, duration: float) -> str:
-    params = {"track_name": track}
-    if artist:
-        params["artist_name"] = artist
-    try:
-        response = requests.get(
-            "https://lrclib.net/api/search",
-            params=params,
-            headers={"User-Agent": "KaraokeWorkshop/1.0 (local personal-use app)"},
+def _lookup_key(value: str) -> str:
+    value = to_traditional_chinese(unicodedata.normalize("NFKC", value)).casefold()
+    return re.sub(r"[^\w\u3400-\u9fff]+", "", value)
+
+
+def _lookup_similarity(left: str, right: str) -> float:
+    left_key = _lookup_key(left)
+    right_key = _lookup_key(right)
+    if not left_key or not right_key:
+        return 0.0
+    if left_key in right_key or right_key in left_key:
+        return 1.0
+    return SequenceMatcher(None, left_key, right_key).ratio()
+
+
+def _select_kugeci_candidate(
+    candidates: list[_KugeciCandidate],
+    track: str,
+    artist: str,
+) -> _KugeciCandidate | None:
+    scored: list[tuple[float, float, float, _KugeciCandidate]] = []
+    for candidate in candidates:
+        track_score = _lookup_similarity(candidate.track, track)
+        artist_score = _lookup_similarity(candidate.artist, artist) if artist else 1.0
+        scored.append(
+            (track_score * 4 + artist_score * 2, track_score, artist_score, candidate)
+        )
+
+    if not scored:
+        return None
+    _, track_score, artist_score, best = max(scored, key=lambda item: item[0])
+    if track_score < 0.70 or (artist and artist_score < 0.40):
+        return None
+    return best
+
+
+def _fetch_kugeci_synced_lyrics(track: str, artist: str) -> LyricsLookup | None:
+    headers = {
+        "User-Agent": "KaraokeFactory/1.0 (local personal-use app)",
+        "Accept-Language": "zh-HK,zh-TW;q=0.9,zh;q=0.8,en;q=0.5",
+    }
+    with _native_trust_session() as session:
+        response = session.get(
+            "https://www.kugeci.com/search",
+            params={"q": track},
+            headers=headers,
             timeout=20,
         )
         response.raise_for_status()
-        payload = response.json()
-    except (requests.RequestException, json.JSONDecodeError) as exc:
-        raise PipelineError("連接同步歌詞服務失敗；請改為上載 LRC 歌詞。") from exc
+        response.encoding = "utf-8"
 
-    choices = [item for item in payload if item.get("syncedLyrics")]
-    if not choices:
-        raise PipelineError(
-            f"搵唔到「{track}」嘅同步歌詞。請上載有時間碼嘅 LRC 檔案。"
+        parser = _KugeciSearchParser()
+        parser.feed(response.text)
+        candidate = _select_kugeci_candidate(parser.candidates, track, artist)
+        if candidate is None:
+            return None
+
+        lyric_response = session.get(
+            f"https://www.kugeci.com/download/lrc/{candidate.song_id}",
+            headers=headers,
+            timeout=20,
         )
+        lyric_response.raise_for_status()
+
+    lyric_text = _decode_lyric_bytes(lyric_response.content).strip()
+    if not has_lrc_timestamps(lyric_text):
+        return None
+    return LyricsLookup(
+        lyrics=lyric_text,
+        track=candidate.track,
+        artist=candidate.artist,
+        source="Kugeci",
+        source_url=f"https://www.kugeci.com/song/{candidate.song_id}",
+    )
+
+
+def _fetch_lrclib_synced_lyrics(
+    track: str,
+    artist: str,
+    duration: float,
+) -> LyricsLookup | None:
+    params = {"track_name": track}
+    if artist:
+        params["artist_name"] = artist
+    with _native_trust_session() as session:
+        response = session.get(
+            "https://lrclib.net/api/search",
+            params=params,
+            headers={"User-Agent": "KaraokeFactory/1.0 (local personal-use app)"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise requests.RequestException("LRCLIB returned invalid JSON") from exc
+
+    if not isinstance(payload, list):
+        raise requests.RequestException("LRCLIB returned an unexpected response")
+    choices = [
+        item
+        for item in payload
+        if isinstance(item, dict) and item.get("syncedLyrics")
+    ]
+    if not choices:
+        return None
     best = max(choices, key=lambda item: _lyric_score(item, track, artist, duration))
-    return str(best["syncedLyrics"])
+    return LyricsLookup(
+        lyrics=str(best["syncedLyrics"]),
+        track=str(best.get("trackName") or track),
+        artist=str(best.get("artistName") or artist),
+        source="LRCLIB",
+        source_url="https://lrclib.net/",
+    )
+
+
+def lookup_synced_lyrics(
+    track: str,
+    artist: str = "",
+    duration: float = 0.0,
+) -> LyricsLookup:
+    track = track.strip()
+    artist = artist.strip()
+    if not track:
+        raise PipelineError("自動搵歌詞前，請先填寫歌名。")
+
+    failures: list[str] = []
+    try:
+        kugeci_result = _fetch_kugeci_synced_lyrics(track, artist)
+    except (requests.RequestException, OSError, ssl.SSLError) as exc:
+        failures.append(f"Kugeci: {type(exc).__name__}: {exc}")
+    else:
+        if kugeci_result is not None:
+            return kugeci_result
+
+    try:
+        lrclib_result = _fetch_lrclib_synced_lyrics(track, artist, duration)
+    except (requests.RequestException, OSError, ssl.SSLError) as exc:
+        failures.append(f"LRCLIB: {type(exc).__name__}: {exc}")
+    else:
+        if lrclib_result is not None:
+            return lrclib_result
+
+    details = "\n".join(failures)
+    raise PipelineError(
+        f"Kugeci 同後備同步歌詞服務都搵唔到「{track}」。"
+        "請改用「上載 LRC」或「貼上歌詞」。",
+        technical_details=details,
+    )
+
+
+def _fetch_synced_lyrics(track: str, artist: str, duration: float) -> str:
+    return lookup_synced_lyrics(track, artist, duration).lyrics
 
 
 def _prepare_lyrics(
     settings: JobSettings,
     source: SourceInfo,
+    lookup: LyricsLookup | None = None,
 ) -> tuple[list[LyricLine], bool, str, str]:
-    track = settings.track_name.strip() or _normalise_title(source.title)
-    artist = settings.artist_name.strip() or source.artist.strip()
+    track = (
+        settings.track_name.strip()
+        or (lookup.track if lookup else "")
+        or _normalise_title(source.title)
+    )
+    artist = (
+        settings.artist_name.strip()
+        or (lookup.artist if lookup else "")
+        or source.artist.strip()
+    )
 
     if settings.lyrics_source == "auto":
-        if not track:
-            raise PipelineError("自動搵歌詞需要歌名。")
-        lyric_text = _fetch_synced_lyrics(track, artist, source.duration)
+        if lookup is None:
+            raise PipelineError("未確認同步歌詞，程式唔會開始下載或分離影片。")
+        lyric_text = lookup.lyrics
     else:
         lyric_text = settings.lyrics_text.strip()
         if not lyric_text:
@@ -557,6 +811,20 @@ def run_pipeline(
     settings: JobSettings,
     callback: ProgressCallback | None = None,
 ) -> PipelineResult:
+    lyrics_lookup: LyricsLookup | None = None
+    if settings.lyrics_source == "auto":
+        _report(callback, "lyrics", 0.01, "先到 Kugeci 搜尋同步歌詞…")
+        lyrics_lookup = lookup_synced_lyrics(
+            settings.track_name,
+            settings.artist_name,
+        )
+        _report(
+            callback,
+            "lyrics",
+            0.02,
+            f"已從 {lyrics_lookup.source} 找到同步歌詞，準備影片…",
+        )
+
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     job_dir = WORK_DIR / uuid.uuid4().hex
@@ -588,8 +856,12 @@ def run_pipeline(
             instrumental = job_dir / "instrumental.wav"
             _center_channel_remove(mixture, instrumental)
 
-        _report(callback, "lyrics", 0.68, "正在準備同步歌詞…")
-        lyric_lines, timing_estimated, track, artist = _prepare_lyrics(settings, source)
+        _report(callback, "lyrics", 0.68, "正在套用已確認嘅同步歌詞…")
+        lyric_lines, timing_estimated, track, artist = _prepare_lyrics(
+            settings,
+            source,
+            lyrics_lookup,
+        )
         subtitle_path = job_dir / "karaoke.ass"
         write_ass(
             subtitle_path,

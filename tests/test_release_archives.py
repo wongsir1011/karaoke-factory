@@ -26,8 +26,8 @@ def test_release_archives_have_platform_specific_launchers(tmp_path: Path) -> No
             assert mode & stat.S_IXUSR
 
 
-def test_download_page_links_both_v030_installers() -> None:
+def test_download_page_links_both_v040_installers() -> None:
     html = (ROOT / "index.html").read_text(encoding="utf-8")
 
-    assert "v0.3.0-rc.1/Karaoke_Factory_Windows.zip" in html
-    assert "v0.3.0-rc.1/Karaoke_Factory_macOS.zip" in html
+    assert "v0.4.0-rc.1/Karaoke_Factory_Windows.zip" in html
+    assert "v0.4.0-rc.1/Karaoke_Factory_macOS.zip" in html
