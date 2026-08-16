@@ -33,6 +33,34 @@ install_or_reinstall_formula() {
     fi
 }
 
+pip_install_with_retry() {
+    local description="$1"
+    shift
+    local attempt=1
+    local max_attempts=3
+    local retry_delay=5
+
+    while true; do
+        echo "$description（第 $attempt/$max_attempts 次）……"
+        if "$VENV_PYTHON" -m pip install \
+            --retries 10 \
+            --timeout 60 \
+            --disable-pip-version-check \
+            "$@"; then
+            return 0
+        fi
+        if [[ $attempt -ge $max_attempts ]]; then
+            echo "$description 連續 $max_attempts 次失敗。"
+            echo "如果訊息包含 502／503，通常係 PyPI 下載服務暫時繁忙，請稍後再執行 setup.command。"
+            return 1
+        fi
+        echo "下載服務暫時未能連線，等待 $retry_delay 秒後自動再試……"
+        sleep "$retry_delay"
+        attempt=$((attempt + 1))
+        retry_delay=$((retry_delay + 5))
+    done
+}
+
 WITH_AI=0
 if [[ "${1:-}" == "--with-ai" ]]; then
     WITH_AI=1
@@ -112,17 +140,19 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
     "$PYTHON_BIN" -m venv "$PROJECT_DIR/.venv"
 fi
 
-echo "正在安裝 K 歌工房基本套件……"
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
-"$VENV_PYTHON" -m pip install -r requirements.txt
+pip_install_with_retry "正在更新 Python 安裝工具" --upgrade pip setuptools wheel
+pip_install_with_retry "正在安裝 K 歌工房基本套件" -r requirements.txt
 
 if [[ $WITH_AI -eq 1 ]]; then
     MACHINE="$(uname -m)"
-    echo "正在安裝 Demucs AI 套件；下載時間可能較長……"
     if [[ "$MACHINE" == "arm64" ]]; then
-        "$VENV_PYTHON" -m pip install -r requirements-ai-macos.txt
+        pip_install_with_retry \
+            "正在安裝 Demucs AI 套件；下載時間可能較長" \
+            -r requirements-ai-macos.txt
     elif [[ "$MACHINE" == "x86_64" ]]; then
-        "$VENV_PYTHON" -m pip install -r requirements-ai-macos-intel.txt
+        pip_install_with_retry \
+            "正在安裝 Demucs AI 套件；下載時間可能較長" \
+            -r requirements-ai-macos-intel.txt
     else
         echo "未支援的 Mac 架構：$MACHINE"
         exit 1

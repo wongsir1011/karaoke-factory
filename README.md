@@ -36,7 +36,7 @@ AI 套件較大，而且第一次處理歌曲時會再下載 Demucs 模型。冇
 
 下載並解壓縮 macOS 安裝包後，首次雙擊 `setup.command`。安裝完成後，雙擊 `start.command` 開啟程式。
 
-如要安裝高質 Demucs AI 模式，雙擊 `install-ai.command`。安裝程式會自動識別 Apple Silicon 或 Intel Mac，並選擇相容嘅 PyTorch 套件。
+`setup.command` 安裝基本功能；如要額外安裝高質 Demucs AI 模式，就雙擊 `install-ai.command`。後者會先執行相同基本安裝，再自動識別 Apple Silicon 或 Intel Mac，並選擇相容嘅 PyTorch 套件。遇到 PyPI 502／503 或短暫網絡錯誤時，macOS 安裝器會延長 pip 逾時並自動重試。
 
 macOS 版透過 Homebrew 安裝 Python 3.12、包含 ASS 動態字幕支援嘅 `ffmpeg@7`，以及 Deno。如果尚未安裝 Homebrew，`setup.command` 會開啟官方安裝頁。新版 `start.command` 亦會自動偵測同修復缺少字幕濾鏡嘅舊版 FFmpeg。由於目前測試版未經 Apple Developer ID 簽署，首次開啟 `.command` 時可能需要在 Finder 按住 Control 點擊檔案，再選擇「開啟」。詳細步驟見安裝包內 `README-macOS.txt`。
 

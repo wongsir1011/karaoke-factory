@@ -20,7 +20,11 @@ K 歌工房 macOS 版
 
 高質 AI 人聲分離
 -----------------
-雙擊 install-ai.command 安裝 Demucs AI 模式。套件及模型檔案較大，第一次安裝與第一次處理歌曲需要較長時間。
+`setup.command` 只安裝基本功能，包括 YouTube 下載、快速中心聲道去人聲同影片字幕合成。
+
+`install-ai.command` 會呼叫 `setup.command --with-ai`：先檢查／安裝全部基本功能，再額外安裝 Demucs 及 PyTorch 高質 AI 人聲分離。套件及模型檔案較大，第一次安裝與第一次處理歌曲需要較長時間。
+
+如果 PyPI 暫時回傳 502／503，安裝器會增加 pip 連線重試及逾時時間，並將整個安裝步驟最多自動再試三次；無需立即改用另一個安裝檔。
 
 Apple Silicon 會使用現行 PyTorch；Intel Mac 會自動使用最後提供 Intel macOS 預編譯套件的相容版本。兩種架構均可使用 FFmpeg 快速中心聲道模式。
 

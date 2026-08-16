@@ -31,10 +31,14 @@ def test_release_archives_have_platform_specific_launchers(tmp_path: Path) -> No
         assert "install_or_reinstall_formula ffmpeg-full" in setup_script
         assert "ffmpeg_supports_ass" in setup_script
         assert "ffmpeg_supports_ass" in start_script
+        assert "pip_install_with_retry" in setup_script
+        assert "--retries 10" in setup_script
+        assert "--timeout 60" in setup_script
+        assert "max_attempts=3" in setup_script
 
 
-def test_download_page_links_both_v042_installers() -> None:
+def test_download_page_links_both_v043_installers() -> None:
     html = (ROOT / "index.html").read_text(encoding="utf-8")
 
-    assert "v0.4.2-rc.1/Karaoke_Factory_Windows.zip" in html
-    assert "v0.4.2-rc.1/Karaoke_Factory_macOS.zip" in html
+    assert "v0.4.3-rc.1/Karaoke_Factory_Windows.zip" in html
+    assert "v0.4.3-rc.1/Karaoke_Factory_macOS.zip" in html
