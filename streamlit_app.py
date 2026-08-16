@@ -216,13 +216,14 @@ with st.container(border=True):
 
     with st.expander("進階設定", icon=":material/tune:"):
         max_height = st.selectbox("影片最高解像度", [720, 1080], index=1)
-        lyric_offset_ms = st.number_input(
-            "歌詞整體時間微調（毫秒）",
-            min_value=-10_000,
-            max_value=10_000,
-            value=0,
-            step=100,
-            help="正數令歌詞遲啲出現；負數令歌詞早啲出現。",
+        lyric_offset_seconds = st.number_input(
+            "歌詞整體時間微調（秒）",
+            min_value=-120.0,
+            max_value=120.0,
+            value=0.0,
+            step=0.1,
+            format="%.1f",
+            help="正數令歌詞遲啲出現；負數令歌詞早啲出現。最多可以前後微調 120 秒。",
         )
         font_name = st.text_input("字幕字體", value="Microsoft JhengHei")
         font_size = st.slider("字幕大小", min_value=42, max_value=88, value=64)
@@ -263,7 +264,7 @@ if start:
         track_name=track_name,
         artist_name=artist_name,
         separation_mode="ai" if separation_label == "AI 高質分離" else "center",
-        lyric_offset_ms=int(lyric_offset_ms),
+        lyric_offset_ms=int(round(float(lyric_offset_seconds) * 1_000)),
         max_height=int(max_height),
         font_name=font_name,
         font_size=int(font_size),

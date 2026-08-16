@@ -16,7 +16,7 @@ K 歌工房 macOS 版
 
 由舊版本更新
 ------------
-解壓縮新版後可直接雙擊 start.command。程式會檢查 FFmpeg 有冇包含 ASS 動態字幕支援；如果發現舊版 Homebrew FFmpeg 缺少相關濾鏡，會自動執行 setup.command 安裝相容版本。
+解壓縮新版後可直接雙擊 start.command。程式會檢查 FFmpeg 有冇包含 ASS 動態字幕支援；如果發現舊版 Homebrew FFmpeg 缺少相關濾鏡，會自動執行 setup.command。安裝器會先修復或重裝 ffmpeg@7，仍然失敗就自動改用 ffmpeg-full。
 
 高質 AI 人聲分離
 -----------------
@@ -30,7 +30,7 @@ macOS 安全提示
 
 字幕濾鏡疑難
 ------------
-如果見到 `No such filter: 'ass'`，代表舊版一般 Homebrew FFmpeg 冇包含字幕濾鏡。請關閉 K 歌工房，再雙擊新版 `setup.command`；安裝程式會改用包含 libass 支援嘅 `ffmpeg@7`。
+如果見到 `No such filter: 'ass'`，代表舊版一般 Homebrew FFmpeg 冇包含字幕濾鏡。請關閉 K 歌工房，再雙擊新版 `setup.command`；安裝器會自動重裝包含 libass 支援嘅 `ffmpeg@7`，有需要時再改用 `ffmpeg-full`，毋須自行輸入 Homebrew 指令。
 
 使用限制
 --------

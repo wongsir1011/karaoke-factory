@@ -27,13 +27,14 @@ def test_release_archives_have_platform_specific_launchers(tmp_path: Path) -> No
 
         setup_script = archive.read("setup.command").decode("utf-8")
         start_script = archive.read("start.command").decode("utf-8")
-        assert "brew install ffmpeg@7" in setup_script
+        assert "install_or_reinstall_formula ffmpeg@7" in setup_script
+        assert "install_or_reinstall_formula ffmpeg-full" in setup_script
         assert "ffmpeg_supports_ass" in setup_script
         assert "ffmpeg_supports_ass" in start_script
 
 
-def test_download_page_links_both_v041_installers() -> None:
+def test_download_page_links_both_v042_installers() -> None:
     html = (ROOT / "index.html").read_text(encoding="utf-8")
 
-    assert "v0.4.1-rc.1/Karaoke_Factory_Windows.zip" in html
-    assert "v0.4.1-rc.1/Karaoke_Factory_macOS.zip" in html
+    assert "v0.4.2-rc.1/Karaoke_Factory_Windows.zip" in html
+    assert "v0.4.2-rc.1/Karaoke_Factory_macOS.zip" in html

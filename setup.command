@@ -9,8 +9,28 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 ffmpeg_supports_ass() {
     local candidate="${1:-}"
     [[ -n "$candidate" && -x "$candidate" ]] || return 1
-    "$candidate" -hide_banner -filters 2>/dev/null \
-        | grep -Eq '[[:space:]]ass[[:space:]]+V->V'
+    "$candidate" -hide_banner -filters 2>&1 \
+        | awk '$2 == "ass" { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+formula_ffmpeg_path() {
+    local formula="$1"
+    local prefix=""
+    prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+    if [[ -n "$prefix" ]]; then
+        printf '%s/bin/ffmpeg\n' "$prefix"
+    fi
+}
+
+install_or_reinstall_formula() {
+    local formula="$1"
+    if brew list --versions "$formula" >/dev/null 2>&1; then
+        echo "正在重新安裝 $formula……"
+        brew reinstall "$formula"
+    else
+        echo "正在安裝 $formula……"
+        brew install "$formula"
+    fi
 }
 
 WITH_AI=0
@@ -60,15 +80,22 @@ if ! ffmpeg_supports_ass "$FFMPEG_BIN"; then
     else
         echo "正在安裝包含 ASS 動態字幕支援嘅 FFmpeg……"
     fi
-    if ! brew list --versions ffmpeg@7 >/dev/null 2>&1; then
-        brew install ffmpeg@7
+    FFMPEG_BIN="$(formula_ffmpeg_path ffmpeg@7)"
+    if ! ffmpeg_supports_ass "$FFMPEG_BIN"; then
+        install_or_reinstall_formula ffmpeg@7
+        FFMPEG_BIN="$(formula_ffmpeg_path ffmpeg@7)"
     fi
-    FFMPEG_BIN="$(brew --prefix ffmpeg@7)/bin/ffmpeg"
 fi
 
 if ! ffmpeg_supports_ass "$FFMPEG_BIN"; then
-    echo "FFmpeg 安裝完成，但仍然搵唔到 ASS 字幕濾鏡。"
-    echo "請執行：brew reinstall ffmpeg@7"
+    echo "ffmpeg@7 仍然缺少 ASS 濾鏡，正在改用完整版本……"
+    install_or_reinstall_formula ffmpeg-full
+    FFMPEG_BIN="$(formula_ffmpeg_path ffmpeg-full)"
+fi
+
+if ! ffmpeg_supports_ass "$FFMPEG_BIN"; then
+    echo "已嘗試安裝 ffmpeg@7 同 ffmpeg-full，但仍然搵唔到 ASS 字幕濾鏡。"
+    echo "請將以上完整安裝訊息回報，方便進一步診斷。"
     exit 1
 fi
 export PATH="$(dirname "$FFMPEG_BIN"):$PATH"

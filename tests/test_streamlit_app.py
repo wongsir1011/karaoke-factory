@@ -19,6 +19,15 @@ def test_app_initial_view_renders_without_exception() -> None:
         "3. 聲音同字幕設定",
     ]
     assert app.toggle[0].label == "影片要求登入時使用瀏覽器 cookies"
+    lyric_offset = next(
+        item
+        for item in app.number_input
+        if item.label == "歌詞整體時間微調（秒）"
+    )
+    assert lyric_offset.min == -120.0
+    assert lyric_offset.max == 120.0
+    assert lyric_offset.proto.step == 0.1
+    assert lyric_offset.proto.format == "%.1f"
 
     app.toggle[0].set_value(True).run()
     assert not app.exception
