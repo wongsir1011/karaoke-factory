@@ -16,6 +16,7 @@ from karaoke_maker.pipeline import (
     _YoutubeLogger,
     _center_channel_remove,
     _extract_audio,
+    _ffmpeg_filter_available,
     _ffmpeg_path,
     _filter_escape,
     _render_video,
@@ -41,6 +42,35 @@ def test_safe_filename_removes_windows_characters() -> None:
 def test_ffmpeg_filter_escape_handles_windows_drive() -> None:
     escaped = _filter_escape(Path("C:/Music/lyrics.ass"))
     assert "\\:" in escaped
+
+
+def test_ffmpeg_has_ass_subtitle_filter() -> None:
+    assert _ffmpeg_filter_available("ass") is True
+
+
+def test_missing_ass_filter_stops_before_youtube_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download_started = False
+
+    def unexpected_download(*_: object, **__: object) -> None:
+        nonlocal download_started
+        download_started = True
+
+    monkeypatch.setattr(pipeline, "_ffmpeg_filter_available", lambda *_: False)
+    monkeypatch.setattr(pipeline, "_download_youtube", unexpected_download)
+
+    with pytest.raises(PipelineError, match="ASS 動態字幕濾鏡"):
+        run_pipeline(
+            JobSettings(
+                source_type="youtube",
+                youtube_url="https://youtu.be/abcdefghijk",
+                lyrics_source="lrc",
+                lyrics_text="[00:01.00]測試",
+            )
+        )
+
+    assert download_started is False
 
 
 def test_youtube_options_enable_reliable_download_features(tmp_path: Path) -> None:

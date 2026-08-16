@@ -6,6 +6,13 @@ PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+ffmpeg_supports_ass() {
+    local candidate="${1:-}"
+    [[ -n "$candidate" && -x "$candidate" ]] || return 1
+    "$candidate" -hide_banner -filters 2>/dev/null \
+        | grep -Eq '[[:space:]]ass[[:space:]]+V->V'
+}
+
 WITH_AI=0
 if [[ "${1:-}" == "--with-ai" ]]; then
     WITH_AI=1
@@ -46,10 +53,26 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
     exit 1
 fi
 
-if ! command -v ffmpeg >/dev/null 2>&1; then
-    echo "正在安裝 FFmpeg……"
-    brew install ffmpeg
+FFMPEG_BIN="$(command -v ffmpeg || true)"
+if ! ffmpeg_supports_ass "$FFMPEG_BIN"; then
+    if [[ -n "$FFMPEG_BIN" ]]; then
+        echo "現有 FFmpeg 缺少 ASS 動態字幕支援，正在安裝相容版本……"
+    else
+        echo "正在安裝包含 ASS 動態字幕支援嘅 FFmpeg……"
+    fi
+    if ! brew list --versions ffmpeg@7 >/dev/null 2>&1; then
+        brew install ffmpeg@7
+    fi
+    FFMPEG_BIN="$(brew --prefix ffmpeg@7)/bin/ffmpeg"
 fi
+
+if ! ffmpeg_supports_ass "$FFMPEG_BIN"; then
+    echo "FFmpeg 安裝完成，但仍然搵唔到 ASS 字幕濾鏡。"
+    echo "請執行：brew reinstall ffmpeg@7"
+    exit 1
+fi
+export PATH="$(dirname "$FFMPEG_BIN"):$PATH"
+echo "FFmpeg 動態字幕支援已確認：$FFMPEG_BIN"
 
 if ! command -v deno >/dev/null 2>&1 && ! command -v node >/dev/null 2>&1; then
     echo "正在安裝 Deno，供 YouTube 下載解算使用……"
@@ -81,4 +104,3 @@ fi
 
 echo
 echo "安裝完成。請雙擊 start.command 開啟 K 歌工房。"
-

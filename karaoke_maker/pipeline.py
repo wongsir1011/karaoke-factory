@@ -296,6 +296,49 @@ def _ffmpeg_path() -> Path:
         ) from exc
 
 
+def _ffmpeg_filter_available(filter_name: str) -> bool:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    process = subprocess.run(
+        [str(_ffmpeg_path()), "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+        check=False,
+    )
+    if process.returncode != 0:
+        return False
+    for line in process.stdout.splitlines():
+        columns = line.split()
+        if len(columns) >= 2 and columns[1] == filter_name:
+            return True
+    return False
+
+
+def _ensure_subtitle_rendering_support() -> None:
+    if _ffmpeg_filter_available("ass"):
+        return
+
+    ffmpeg = _ffmpeg_path()
+    if sys.platform == "darwin":
+        message = (
+            "目前嘅 FFmpeg 冇包含 ASS 動態字幕濾鏡。請關閉程式，重新雙擊 "
+            "`setup.command`；新版安裝程式會安裝包含字幕支援嘅 FFmpeg，之後再試。"
+        )
+    elif os.name == "nt":
+        message = (
+            "目前嘅 FFmpeg 冇包含 ASS 動態字幕濾鏡。請關閉程式，重新執行 "
+            "`.\\setup.ps1` 後再試。"
+        )
+    else:
+        message = "目前嘅 FFmpeg 冇包含 ASS 動態字幕濾鏡；請安裝啟用 libass 嘅 FFmpeg。"
+    raise PipelineError(
+        message,
+        technical_details=f"FFmpeg missing required filter: ass ({ffmpeg})",
+    )
+
+
 def _run_command(command: list[str], *, description: str) -> str:
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     process = subprocess.run(
@@ -824,6 +867,9 @@ def run_pipeline(
             0.02,
             f"已從 {lyrics_lookup.source} 找到同步歌詞，準備影片…",
         )
+
+    _report(callback, "system", 0.03, "正在檢查動態字幕支援…")
+    _ensure_subtitle_rendering_support()
 
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
