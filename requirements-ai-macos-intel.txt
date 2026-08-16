@@ -1,0 +1,6 @@
+-r requirements.txt
+numpy<2
+demucs==4.0.1
+torch==2.2.2
+torchaudio==2.2.2
+

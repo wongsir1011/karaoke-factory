@@ -31,6 +31,14 @@ AI 套件較大，而且第一次處理歌曲時會再下載 Demucs 模型。冇
 
 可靠下載 YouTube 亦需要 Deno 2.3+ 或 Node.js 22+；安裝程式會自動檢查。程式會優先使用安全嘅 Windows 系統憑證庫，唔會關閉 HTTPS 驗證。
 
+## 開始使用（macOS）
+
+下載並解壓縮 macOS 安裝包後，首次雙擊 `setup.command`。安裝完成後，雙擊 `start.command` 開啟程式。
+
+如要安裝高質 Demucs AI 模式，雙擊 `install-ai.command`。安裝程式會自動識別 Apple Silicon 或 Intel Mac，並選擇相容嘅 PyTorch 套件。
+
+macOS 版透過 Homebrew 安裝 Python 3.12、FFmpeg 及 Deno。如果尚未安裝 Homebrew，`setup.command` 會開啟官方安裝頁。由於目前測試版未經 Apple Developer ID 簽署，首次開啟 `.command` 時可能需要在 Finder 按住 Control 點擊檔案，再選擇「開啟」。詳細步驟見安裝包內 `README-macOS.txt`。
+
 ## YouTube 下載疑難
 
 - 一般公開影片：保持「使用瀏覽器 cookies」關閉。
@@ -58,7 +66,7 @@ AI 套件較大，而且第一次處理歌曲時會再下載 Demucs 模型。冇
 
 正式項目頁：<https://karaoke-factory-hk.vercel.app>
 
-Vercel 部署係項目介紹及下載頁。Streamlit 需要持續 WebSocket session，而 Demucs、FFmpeg、YouTube 下載同影片重新編碼亦超出一般 Vercel Functions 嘅運行模式，因此完整製作功能保留喺 Windows 本機版，避免雲端頁面看似可用但實際處理失敗。
+Vercel 部署係項目介紹及下載頁。Streamlit 需要持續 WebSocket session，而 Demucs、FFmpeg、YouTube 下載同影片重新編碼亦超出一般 Vercel Functions 嘅運行模式，因此完整製作功能保留喺 Windows 或 macOS 本機版，避免雲端頁面看似可用但實際處理失敗。
 
 ## 開發及測試
 

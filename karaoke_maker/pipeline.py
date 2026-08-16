@@ -152,14 +152,23 @@ def _youtube_pipeline_error(exc: Exception, messages: list[str]) -> PipelineErro
     lowered = diagnostics.lower()
 
     if "certificate_verify_failed" in lowered or "certificate verify failed" in lowered:
-        message = (
-            "YouTube 安全連線憑證驗證失敗。程式已使用 Windows 系統憑證庫；"
-            "請檢查防毒軟件、公司網絡或代理伺服器嘅 HTTPS 掃描設定。"
-        )
+        if os.name == "nt":
+            message = (
+                "YouTube 安全連線憑證驗證失敗。程式已使用 Windows 系統憑證庫；"
+                "請檢查防毒軟件、公司網絡或代理伺服器嘅 HTTPS 掃描設定。"
+            )
+        else:
+            message = (
+                "YouTube 安全連線憑證驗證失敗。請確認 macOS 日期時間正確，"
+                "並檢查防毒軟件、公司網絡或代理伺服器嘅 HTTPS 掃描設定。"
+            )
     elif "could not copy" in lowered and "cookie" in lowered:
         message = "讀取瀏覽器 cookies 失敗。請完全關閉所選瀏覽器後再試，或者關閉 cookies 選項。"
     elif "failed to decrypt" in lowered and "cookie" in lowered:
-        message = "Windows 無法解密所選瀏覽器嘅 cookies。請改用同一個 Windows 帳戶執行程式。"
+        if os.name == "nt":
+            message = "Windows 無法解密所選瀏覽器嘅 cookies。請改用同一個 Windows 帳戶執行程式。"
+        else:
+            message = "macOS 無法讀取所選瀏覽器嘅 cookies。請允許終端機存取相關資料，或關閉 cookies 選項。"
     elif any(
         marker in lowered
         for marker in (
