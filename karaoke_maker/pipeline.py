@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Literal
@@ -28,6 +29,12 @@ from .lyrics import (
     lyrics_from_text,
     to_traditional_chinese,
     write_ass,
+)
+from .lyric_timing import (
+    SuggestedLyricLine,
+    align_lyrics_to_transcript,
+    plain_lyric_lines,
+    transcript_tokens_from_segments,
 )
 
 
@@ -68,6 +75,7 @@ class JobSettings:
     font_name: str = "Microsoft JhengHei"
     font_size: int = 64
     highlight_color: str = "#FFC928"
+    prepared_instrumental_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -105,8 +113,31 @@ class PipelineResult:
     separation_mode: str
 
 
+@dataclass(frozen=True)
+class LyricsTimingResult:
+    analysis_id: str
+    preview_path: Path
+    instrumental_path: Path
+    lines: tuple[SuggestedLyricLine, ...]
+    duration: float
+    title: str
+    artist: str
+    language: str
+    model_name: str
+
+    @property
+    def average_confidence(self) -> float:
+        if not self.lines:
+            return 0.0
+        return sum(line.confidence for line in self.lines) / len(self.lines)
+
+
 def ai_separation_available() -> bool:
     return importlib.util.find_spec("demucs") is not None
+
+
+def ai_lyric_timing_available() -> bool:
+    return ai_separation_available() and importlib.util.find_spec("whisper") is not None
 
 
 def _report(callback: ProgressCallback | None, stage: str, value: float, message: str) -> None:
@@ -428,6 +459,65 @@ def _download_youtube(
     return SourceInfo(source_path, title, artist, duration)
 
 
+def _download_youtube_audio(
+    url: str,
+    job_dir: Path,
+    cookie_browser: str,
+    callback: ProgressCallback | None,
+) -> SourceInfo:
+    """Download only the audio needed for lyric timing, not the full MV."""
+    _validate_youtube_url(url)
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise PipelineError("未安裝 yt-dlp；請先執行安裝程式。") from exc
+
+    _report(callback, "download", 0.03, "正在連接 YouTube 並準備音訊…")
+
+    def progress_hook(event: dict[str, object]) -> None:
+        if event.get("status") == "downloading":
+            downloaded = float(event.get("downloaded_bytes") or 0)
+            total = float(event.get("total_bytes") or event.get("total_bytes_estimate") or 0)
+            fraction = downloaded / total if total else 0.1
+            _report(callback, "download", 0.03 + fraction * 0.17, "正在下載分析用音訊…")
+        elif event.get("status") == "finished":
+            _report(callback, "download", 0.20, "音訊下載完成。")
+
+    logger = _YoutubeLogger()
+    options = _youtube_options(
+        job_dir=job_dir,
+        max_height=720,
+        cookie_browser=cookie_browser,
+        progress_hook=progress_hook,
+        logger=logger,
+    )
+    options.update(
+        {
+            "format": "ba/b",
+            "outtmpl": str(job_dir / "timing_source.%(ext)s"),
+        }
+    )
+
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info = downloader.extract_info(url.strip(), download=True)
+    except Exception as exc:
+        raise _youtube_pipeline_error(exc, logger.messages) from exc
+
+    candidates = [
+        path
+        for path in job_dir.glob("timing_source.*")
+        if path.is_file() and path.suffix.lower() not in {".part", ".ytdl", ".json"}
+    ]
+    if not candidates:
+        raise PipelineError("下載完成但搵唔到分析用音訊。")
+    source_path = candidates[0]
+    title = str(info.get("track") or info.get("title") or "YouTube 音訊")
+    artist = str(info.get("artist") or info.get("creator") or info.get("uploader") or "")
+    duration = float(info.get("duration") or 0) or _probe_duration(source_path)
+    return SourceInfo(source_path, title, artist, duration)
+
+
 def _save_upload(settings: JobSettings, job_dir: Path) -> SourceInfo:
     if not settings.upload_bytes:
         raise PipelineError("請先上載一個影片檔案。")
@@ -468,6 +558,27 @@ def _extract_audio(source: Path, output: Path) -> None:
     )
 
 
+def _encode_audio_preview(source: Path, output: Path) -> None:
+    _run_command(
+        [
+            str(_ffmpeg_path()),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "160k",
+            str(output),
+        ],
+        description="建立歌詞校正預覽音訊",
+    )
+
+
 def _center_channel_remove(mixture: Path, instrumental: Path) -> None:
     _run_command(
         [
@@ -488,25 +599,219 @@ def _center_channel_remove(mixture: Path, instrumental: Path) -> None:
     )
 
 
-def _demucs_separate(mixture: Path, instrumental: Path) -> Path:
+def _demucs_separate(
+    mixture: Path,
+    instrumental: Path,
+    vocals: Path | None = None,
+) -> Path:
     if not ai_separation_available():
         raise PipelineError(
             "未安裝 Demucs AI 套件。請關閉程式後執行 `.\\setup.ps1 -WithAI`，"
             "或者改用「快速中心聲道」模式。"
         )
+    command = [
+        sys.executable,
+        "-m",
+        "karaoke_maker.demucs_runner",
+        str(mixture),
+        str(instrumental),
+    ]
+    if vocals is not None:
+        command.extend(["--vocals-output", str(vocals)])
     _run_command(
-        [
-            sys.executable,
-            "-m",
-            "karaoke_maker.demucs_runner",
-            str(mixture),
-            str(instrumental),
-        ],
+        command,
         description="AI 人聲分離",
     )
     if not instrumental.exists():
         raise PipelineError("Demucs 已完成，但搵唔到無人聲音軌。")
+    if vocals is not None and not vocals.exists():
+        raise PipelineError("Demucs 已完成，但搵唔到主唱音軌。")
     return instrumental
+
+
+@lru_cache(maxsize=1)
+def _load_whisper_model(model_name: str) -> tuple[object, str]:
+    try:
+        import torch
+        import whisper
+    except ImportError as exc:
+        raise PipelineError(
+            "未安裝 AI 歌詞對時套件。請關閉程式後執行 install-ai 安裝程式。"
+        ) from exc
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_dir = BASE_DIR / "work" / "models" / "whisper"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        model = whisper.load_model(
+            model_name,
+            device=device,
+            download_root=str(model_dir),
+        )
+    except Exception as exc:
+        raise PipelineError(
+            "下載或載入歌聲辨認模型失敗。請檢查網絡及可用磁碟空間後再試。",
+            technical_details=f"{type(exc).__name__}: {exc}",
+        ) from exc
+    return model, device
+
+
+def _transcribe_vocals(
+    vocals: Path,
+    language: Literal["cantonese", "mandarin", "auto"],
+    model_name: Literal["small", "turbo"],
+) -> list[dict[str, object]]:
+    model, device = _load_whisper_model(model_name)
+    language_code: str | None
+    if language == "cantonese":
+        # The dedicated Cantonese token was added with large-v3/turbo. The
+        # smaller multilingual model uses the broader Chinese token.
+        language_code = "yue" if model_name == "turbo" else "zh"
+    elif language == "mandarin":
+        language_code = "zh"
+    else:
+        language_code = None
+
+    try:
+        result = model.transcribe(  # type: ignore[attr-defined]
+            str(vocals),
+            task="transcribe",
+            language=language_code,
+            word_timestamps=True,
+            fp16=device == "cuda",
+            temperature=0,
+            condition_on_previous_text=True,
+        )
+    except Exception as exc:
+        raise PipelineError(
+            "AI 未能完成歌聲辨認。可嘗試改用較準確模式，或者檢查歌曲係咪有太多和音／現場雜聲。",
+            technical_details=f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+    if not isinstance(result, dict):
+        return []
+    segments = result.get("segments")
+    if not isinstance(segments, list):
+        return []
+    return [segment for segment in segments if isinstance(segment, dict)]
+
+
+def prepare_lyrics_timing(
+    settings: JobSettings,
+    lyrics_text: str,
+    *,
+    language: Literal["cantonese", "mandarin", "auto"] = "cantonese",
+    model_name: Literal["small", "turbo"] = "small",
+    callback: ProgressCallback | None = None,
+) -> LyricsTimingResult:
+    """Create editable sentence-level timing suggestions from a song's vocals."""
+    if not ai_lyric_timing_available():
+        raise PipelineError(
+            "AI 歌詞對時尚未安裝。請關閉程式後執行 install-ai 安裝程式。"
+        )
+    if not plain_lyric_lines(lyrics_text):
+        raise PipelineError("請先貼上至少一句普通歌詞。")
+    if language not in {"cantonese", "mandarin", "auto"}:
+        raise PipelineError("歌詞語言設定無效。")
+    if model_name not in {"small", "turbo"}:
+        raise PipelineError("AI 分析模式設定無效。")
+
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    analysis_id = uuid.uuid4().hex
+    job_dir = WORK_DIR / f"lyrics-{analysis_id}"
+    job_dir.mkdir(parents=True)
+    succeeded = False
+
+    try:
+        if settings.source_type == "youtube":
+            source = _download_youtube_audio(
+                settings.youtube_url,
+                job_dir,
+                settings.youtube_cookie_browser,
+                callback,
+            )
+        else:
+            _report(callback, "source", 0.05, "正在讀取上載影片音訊…")
+            source = _save_upload(settings, job_dir)
+
+        _report(callback, "audio", 0.22, "正在準備分析用音軌…")
+        mixture = job_dir / "mixture.wav"
+        _extract_audio(source.path, mixture)
+        preview = job_dir / "preview.mp3"
+        _encode_audio_preview(mixture, preview)
+
+        vocals = job_dir / "vocals.wav"
+        _report(callback, "separate", 0.30, "AI 正在抽出主唱聲；首次會下載模型…")
+        _demucs_separate(mixture, job_dir / "instrumental.wav", vocals)
+
+        _report(callback, "transcribe", 0.62, "AI 正在聆聽主唱及辨認演唱位置…")
+        segments = _transcribe_vocals(vocals, language, model_name)
+        tokens = transcript_tokens_from_segments(segments)
+
+        _report(callback, "align", 0.88, "正在將已確認歌詞逐句配對時間…")
+        lines = align_lyrics_to_transcript(lyrics_text, tokens, source.duration)
+        if not lines:
+            raise PipelineError("歌詞入面搵唔到可以對時嘅句子。")
+
+        instrumental = job_dir / "instrumental.wav"
+        for disposable in (source.path, mixture, vocals):
+            if disposable != preview:
+                try:
+                    disposable.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        _report(callback, "done", 1.0, "AI 句級歌詞對時完成，請逐句覆核。")
+        succeeded = True
+        return LyricsTimingResult(
+            analysis_id=analysis_id,
+            preview_path=preview,
+            instrumental_path=instrumental,
+            lines=tuple(lines),
+            duration=source.duration,
+            title=settings.track_name.strip() or _normalise_title(source.title),
+            artist=settings.artist_name.strip() or source.artist.strip(),
+            language=language,
+            model_name=model_name,
+        )
+    finally:
+        if not succeeded:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def discard_lyrics_timing(result: LyricsTimingResult | None) -> None:
+    """Remove retained preview/separation files for a completed timing analysis."""
+    if result is None:
+        return
+    try:
+        work_root = WORK_DIR.resolve()
+        analysis_dir = result.preview_path.parent.resolve()
+        relative = analysis_dir.relative_to(work_root)
+    except (OSError, ValueError):
+        return
+    if relative.parts != (f"lyrics-{result.analysis_id}",):
+        return
+    shutil.rmtree(analysis_dir, ignore_errors=True)
+
+
+def _prepared_instrumental(settings: JobSettings) -> Path | None:
+    raw_path = settings.prepared_instrumental_path.strip()
+    if not raw_path:
+        return None
+    try:
+        work_root = WORK_DIR.resolve()
+        candidate = Path(raw_path).resolve()
+        relative = candidate.relative_to(work_root)
+    except (OSError, ValueError):
+        return None
+    if (
+        len(relative.parts) != 2
+        or not relative.parts[0].startswith("lyrics-")
+        or relative.parts[1] != "instrumental.wav"
+        or not candidate.is_file()
+    ):
+        return None
+    return candidate
 
 
 class _NativeTrustAdapter(HTTPAdapter):
@@ -890,14 +1195,24 @@ def run_pipeline(
             _report(callback, "source", 0.05, "正在讀取上載影片…")
             source = _save_upload(settings, job_dir)
 
-        _report(callback, "audio", 0.30, "正在抽取高質音軌…")
-        mixture = job_dir / "mixture.wav"
-        _extract_audio(source.path, mixture)
+        prepared_instrumental = (
+            _prepared_instrumental(settings)
+            if settings.separation_mode == "ai"
+            else None
+        )
+        if prepared_instrumental is not None:
+            _report(callback, "separate", 0.62, "正在重用歌詞對時已分離嘅伴奏音軌…")
+            instrumental = job_dir / "instrumental.wav"
+            shutil.copy2(prepared_instrumental, instrumental)
+        else:
+            _report(callback, "audio", 0.30, "正在抽取高質音軌…")
+            mixture = job_dir / "mixture.wav"
+            _extract_audio(source.path, mixture)
 
-        if settings.separation_mode == "ai":
+        if settings.separation_mode == "ai" and prepared_instrumental is None:
             _report(callback, "separate", 0.38, "AI 正在分離人聲；首次會下載模型…")
             instrumental = _demucs_separate(mixture, job_dir / "instrumental.wav")
-        else:
+        elif settings.separation_mode == "center":
             _report(callback, "separate", 0.42, "正在消除中心聲道人聲…")
             instrumental = job_dir / "instrumental.wav"
             _center_channel_remove(mixture, instrumental)

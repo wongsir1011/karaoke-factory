@@ -14,12 +14,21 @@ def test_release_archives_have_platform_specific_launchers(tmp_path: Path) -> No
         windows_names = set(archive.namelist())
         assert "start.bat" in windows_names
         assert "start.command" not in windows_names
+        assert "karaoke_maker/lyric_timing.py" in windows_names
+        assert "openai-whisper==20250625" in archive.read(
+            "requirements-ai.txt"
+        ).decode("utf-8")
+        assert "--no-build-isolation" in archive.read("setup.ps1").decode("utf-8")
 
     with zipfile.ZipFile(macos_archive) as archive:
         macos_names = set(archive.namelist())
         assert "start.command" in macos_names
         assert "start.bat" not in macos_names
         assert "requirements-ai-macos-intel.txt" in macos_names
+        assert "karaoke_maker/lyric_timing.py" in macos_names
+        assert "openai-whisper==20250625" in archive.read(
+            "requirements-ai-macos.txt"
+        ).decode("utf-8")
 
         for command_name in ("setup.command", "start.command", "install-ai.command"):
             mode = archive.getinfo(command_name).external_attr >> 16
@@ -35,10 +44,12 @@ def test_release_archives_have_platform_specific_launchers(tmp_path: Path) -> No
         assert "--retries 10" in setup_script
         assert "--timeout 60" in setup_script
         assert "max_attempts=3" in setup_script
+        assert "--no-build-isolation" in setup_script
 
 
-def test_download_page_links_both_v043_installers() -> None:
+def test_download_page_links_both_v050_installers() -> None:
     html = (ROOT / "index.html").read_text(encoding="utf-8")
 
-    assert "v0.4.3-rc.1/Karaoke_Factory_Windows.zip" in html
-    assert "v0.4.3-rc.1/Karaoke_Factory_macOS.zip" in html
+    assert "v0.5.0-rc.1/Karaoke_Factory_Windows.zip" in html
+    assert "v0.5.0-rc.1/Karaoke_Factory_macOS.zip" in html
+    assert "AI 句級歌詞對時" in html

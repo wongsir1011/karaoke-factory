@@ -147,12 +147,12 @@ if [[ $WITH_AI -eq 1 ]]; then
     MACHINE="$(uname -m)"
     if [[ "$MACHINE" == "arm64" ]]; then
         pip_install_with_retry \
-            "正在安裝 Demucs AI 套件；下載時間可能較長" \
-            -r requirements-ai-macos.txt
+            "正在安裝 Demucs、Whisper AI 套件；下載時間可能較長" \
+            --no-build-isolation -r requirements-ai-macos.txt
     elif [[ "$MACHINE" == "x86_64" ]]; then
         pip_install_with_retry \
-            "正在安裝 Demucs AI 套件；下載時間可能較長" \
-            -r requirements-ai-macos-intel.txt
+            "正在安裝 Demucs、Whisper AI 套件；下載時間可能較長" \
+            --no-build-isolation -r requirements-ai-macos-intel.txt
     else
         echo "未支援的 Mac 架構：$MACHINE"
         exit 1

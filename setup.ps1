@@ -27,11 +27,25 @@ if (-not (Test-Path -LiteralPath $VenvPython)) {
     }
 }
 
+$InstallArguments = @(
+    "--disable-pip-version-check",
+    "--retries", "10",
+    "--timeout", "60"
+)
+& $VenvPython -m pip install @InstallArguments --upgrade pip setuptools wheel
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to update Python installation tools. Please check the network and try again."
+}
+
 if ($WithAI) {
-    & $VenvPython -m pip install -r requirements-ai.txt
+    Write-Host "Installing Demucs separation and Whisper lyric-timing support..." -ForegroundColor Cyan
+    & $VenvPython -m pip install @InstallArguments --no-build-isolation -r requirements-ai.txt
 }
 else {
-    & $VenvPython -m pip install -r requirements.txt
+    & $VenvPython -m pip install @InstallArguments -r requirements.txt
+}
+if ($LASTEXITCODE -ne 0) {
+    throw "Package installation failed. Please check the network and try again."
 }
 
 $DenoCommand = Get-Command deno -ErrorAction SilentlyContinue
@@ -46,4 +60,7 @@ else {
     Write-Warning "YouTube downloads need Deno 2.3+ or Node.js 22+. Install one of them for reliable downloads."
 }
 
+if ($WithAI) {
+    Write-Host "AI separation and sentence-level lyric timing are ready." -ForegroundColor Green
+}
 Write-Host "Setup complete. Run .\start.ps1 to open Karaoke Factory." -ForegroundColor Green

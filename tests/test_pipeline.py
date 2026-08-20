@@ -11,7 +11,9 @@ from karaoke_maker.lyrics import LyricLine, write_ass
 from karaoke_maker.pipeline import (
     JobSettings,
     LyricsLookup,
+    LyricsTimingResult,
     PipelineError,
+    SourceInfo,
     _KugeciCandidate,
     _YoutubeLogger,
     _center_channel_remove,
@@ -19,13 +21,16 @@ from karaoke_maker.pipeline import (
     _ffmpeg_filter_available,
     _ffmpeg_path,
     _filter_escape,
+    _prepared_instrumental,
     _render_video,
     _safe_filename,
     _select_kugeci_candidate,
     _validate_youtube_url,
     _youtube_options,
     _youtube_pipeline_error,
+    discard_lyrics_timing,
     lookup_synced_lyrics,
+    prepare_lyrics_timing,
     run_pipeline,
 )
 
@@ -91,6 +96,171 @@ def test_youtube_options_enable_reliable_download_features(tmp_path: Path) -> No
     assert options["socket_timeout"] == 20
     if os.name == "nt":
         assert options["compat_opts"] == {"no-certifi"}
+
+
+def test_prepare_lyrics_timing_returns_editable_line_suggestions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pipeline, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(pipeline, "ai_lyric_timing_available", lambda: True)
+
+    def fake_save_upload(settings: JobSettings, job_dir: Path) -> SourceInfo:
+        source = job_dir / "source.mp4"
+        source.write_bytes(b"video")
+        return SourceInfo(source, "測試歌", "歌手", 30.0)
+
+    def fake_extract(source: Path, output: Path) -> None:
+        output.write_bytes(b"wav")
+
+    def fake_preview(source: Path, output: Path) -> None:
+        output.write_bytes(b"mp3")
+
+    def fake_separate(mixture: Path, instrumental: Path, vocals: Path | None = None) -> Path:
+        instrumental.write_bytes(b"instrumental")
+        assert vocals is not None
+        vocals.write_bytes(b"vocals")
+        return instrumental
+
+    monkeypatch.setattr(pipeline, "_save_upload", fake_save_upload)
+    monkeypatch.setattr(pipeline, "_extract_audio", fake_extract)
+    monkeypatch.setattr(pipeline, "_encode_audio_preview", fake_preview)
+    monkeypatch.setattr(pipeline, "_demucs_separate", fake_separate)
+    monkeypatch.setattr(
+        pipeline,
+        "_transcribe_vocals",
+        lambda *_: [
+            {
+                "start": 5.0,
+                "end": 6.0,
+                "text": "第一句",
+                "words": [{"start": 5.0, "end": 6.0, "word": "第一句"}],
+            },
+            {
+                "start": 12.0,
+                "end": 13.0,
+                "text": "第二句",
+                "words": [{"start": 12.0, "end": 13.0, "word": "第二句"}],
+            },
+        ],
+    )
+
+    result = prepare_lyrics_timing(
+        JobSettings(
+            source_type="upload",
+            upload_name="song.mp4",
+            upload_bytes=b"video",
+        ),
+        "第一句\n第二句",
+        language="cantonese",
+        model_name="small",
+    )
+
+    assert [line.start for line in result.lines] == [5.0, 12.0]
+    assert result.preview_path.read_bytes() == b"mp3"
+    assert result.average_confidence == 1.0
+    assert result.instrumental_path.read_bytes() == b"instrumental"
+    assert sorted(path.name for path in result.preview_path.parent.glob("*.wav")) == [
+        "instrumental.wav"
+    ]
+
+
+def test_prepared_instrumental_must_be_inside_matching_work_folder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_dir = tmp_path / "work"
+    valid = work_dir / "lyrics-valid" / "instrumental.wav"
+    valid.parent.mkdir(parents=True)
+    valid.write_bytes(b"audio")
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"audio")
+    monkeypatch.setattr(pipeline, "WORK_DIR", work_dir)
+
+    assert _prepared_instrumental(
+        JobSettings(source_type="upload", prepared_instrumental_path=str(valid))
+    ) == valid.resolve()
+    assert _prepared_instrumental(
+        JobSettings(source_type="upload", prepared_instrumental_path=str(outside))
+    ) is None
+
+
+def test_discard_lyrics_timing_removes_only_its_analysis_folder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_dir = tmp_path / "work"
+    analysis_dir = work_dir / "lyrics-abc123"
+    analysis_dir.mkdir(parents=True)
+    preview = analysis_dir / "preview.mp3"
+    instrumental = analysis_dir / "instrumental.wav"
+    preview.write_bytes(b"preview")
+    instrumental.write_bytes(b"audio")
+    monkeypatch.setattr(pipeline, "WORK_DIR", work_dir)
+
+    discard_lyrics_timing(
+        LyricsTimingResult(
+            analysis_id="abc123",
+            preview_path=preview,
+            instrumental_path=instrumental,
+            lines=(),
+            duration=30.0,
+            title="測試",
+            artist="歌手",
+            language="cantonese",
+            model_name="small",
+        )
+    )
+
+    assert not analysis_dir.exists()
+
+
+def test_run_pipeline_reuses_prepared_instrumental_without_extracting_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "outputs"
+    prepared = work_dir / "lyrics-existing" / "instrumental.wav"
+    prepared.parent.mkdir(parents=True)
+    prepared.write_bytes(b"prepared accompaniment")
+    monkeypatch.setattr(pipeline, "WORK_DIR", work_dir)
+    monkeypatch.setattr(pipeline, "OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(pipeline, "_ensure_subtitle_rendering_support", lambda: None)
+
+    def fake_save_upload(settings: JobSettings, job_dir: Path) -> SourceInfo:
+        source = job_dir / "source.mp4"
+        source.write_bytes(b"video")
+        return SourceInfo(source, "測試歌", "歌手", 30.0)
+
+    def unexpected_extract(*_: object) -> None:
+        pytest.fail("prepared accompaniment should skip audio extraction")
+
+    def fake_render(source: Path, instrumental: Path, subtitles: Path, output: Path) -> None:
+        assert source.read_bytes() == b"video"
+        assert instrumental.read_bytes() == b"prepared accompaniment"
+        assert "第一句" in subtitles.read_text(encoding="utf-8-sig")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"karaoke")
+
+    monkeypatch.setattr(pipeline, "_save_upload", fake_save_upload)
+    monkeypatch.setattr(pipeline, "_extract_audio", unexpected_extract)
+    monkeypatch.setattr(pipeline, "_render_video", fake_render)
+
+    result = run_pipeline(
+        JobSettings(
+            source_type="upload",
+            upload_name="song.mp4",
+            upload_bytes=b"video",
+            lyrics_source="lrc",
+            lyrics_text="[00:01.00]第一句",
+            separation_mode="ai",
+            prepared_instrumental_path=str(prepared),
+        )
+    )
+
+    assert result.output_path.read_bytes() == b"karaoke"
+    assert prepared.exists()
 
 
 def test_youtube_options_do_not_read_cookies_by_default(tmp_path: Path) -> None:

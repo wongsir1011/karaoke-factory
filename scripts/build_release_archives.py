@@ -12,6 +12,7 @@ COMMON_FILES = [
     ".streamlit/config.toml",
     "karaoke_maker/__init__.py",
     "karaoke_maker/demucs_runner.py",
+    "karaoke_maker/lyric_timing.py",
     "karaoke_maker/lyrics.py",
     "karaoke_maker/pipeline.py",
     "requirements.txt",
@@ -73,4 +74,3 @@ def build_archives(output_dir: Path | None = None) -> tuple[Path, Path]:
 if __name__ == "__main__":
     for built_archive in build_archives():
         print(built_archive)
-

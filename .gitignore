@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 .pytest_cache/
+pip-*/
+pytest-of-*/
 *.py[cod]
 work/
 outputs/*.mp4

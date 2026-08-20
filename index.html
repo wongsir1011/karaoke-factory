@@ -42,7 +42,7 @@
       }
       .button.primary { color: #1a1400; background: var(--accent); border-color: var(--accent); }
       .button.macos { color: #17171f; background: #f7f4f2; border-color: #f7f4f2; }
-      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
       .card { padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: color-mix(in srgb, var(--panel) 90%, transparent); }
       .card strong { display: block; margin-bottom: 10px; font-size: 1.1rem; }
       .card p { margin: 0; color: var(--muted); line-height: 1.65; }
@@ -60,13 +60,14 @@
         程式會先到 Kugeci 確認同步歌詞，搵唔到先用後備服務；所有中文歌詞會自動統一成香港繁體。
       </p>
       <div class="actions">
-        <a class="button primary" href="https://github.com/wongsir1011/karaoke-factory/releases/download/v0.4.3-rc.1/Karaoke_Factory_Windows.zip">下載 Windows（v0.4.3 RC1）</a>
-        <a class="button macos" href="https://github.com/wongsir1011/karaoke-factory/releases/download/v0.4.3-rc.1/Karaoke_Factory_macOS.zip">下載 macOS（v0.4.3 RC1）</a>
+        <a class="button primary" href="https://github.com/wongsir1011/karaoke-factory/releases/download/v0.5.0-rc.1/Karaoke_Factory_Windows.zip">下載 Windows（v0.5.0 RC1）</a>
+        <a class="button macos" href="https://github.com/wongsir1011/karaoke-factory/releases/download/v0.5.0-rc.1/Karaoke_Factory_macOS.zip">下載 macOS（v0.5.0 RC1）</a>
         <a class="button" href="https://github.com/wongsir1011/karaoke-factory">查看 GitHub 原始碼</a>
       </div>
       <section class="grid" aria-label="主要功能">
         <article class="card"><strong>AI 人聲分離</strong><p>Demucs 高質模式，另備 FFmpeg 快速中心聲道模式。</p></article>
         <article class="card"><strong>處理前先確認歌詞</strong><p>Kugeci 優先，搵唔到先用後備服務；簡體來源亦會轉成香港繁體。</p></article>
+        <article class="card"><strong>AI 句級歌詞對時</strong><p>搵唔到 LRC 時，程式會聽歌產生初步時間，再由用戶播放及逐句校正。</p></article>
         <article class="card"><strong>可靠 macOS 安裝</strong><p>自動修復字幕濾鏡；遇到 PyPI 502／503 或短暫網絡錯誤會自動重試。</p></article>
       </section>
       <div class="notice">
