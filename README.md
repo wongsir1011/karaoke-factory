@@ -33,6 +33,8 @@ AI 套件較大，而且第一次處理歌曲時會再下載 Demucs 及 Whisper 
 
 可靠下載 YouTube 亦需要 Deno 2.3+ 或 Node.js 22+；安裝程式會自動檢查。程式會優先使用安全嘅 Windows 系統憑證庫，唔會關閉 HTTPS 驗證。
 
+v0.5.1 起，Windows 安裝器會核對 JavaScript runtime 實際版本；搵唔到合規格 runtime 時會嘗試透過 winget 安裝 Deno。macOS 安裝器亦已修正系統內置 Bash 3.2 對中文標點旁變數嘅解析問題，避免安裝中途停止而漏裝 Streamlit。yt-dlp 會連同 EJS 套件更新至 2026.08.19。
+
 ## 開始使用（macOS）
 
 下載並解壓縮 macOS 安裝包後，首次雙擊 `setup.command`。安裝完成後，雙擊 `start.command` 開啟程式。

@@ -286,6 +286,19 @@ def test_youtube_error_explains_login_requirement() -> None:
     assert "not a bot" in error.technical_details
 
 
+def test_youtube_error_explains_rate_limit_before_login_requirement() -> None:
+    error = _youtube_pipeline_error(
+        RuntimeError(
+            "HTTP Error 429: Too Many Requests; Sign in to confirm you’re not a bot"
+        ),
+        [],
+    )
+
+    assert "HTTP 429" in str(error)
+    assert "停止重試" in str(error)
+    assert "同一網絡" in str(error)
+
+
 def test_kugeci_candidate_matches_title_and_artist() -> None:
     candidates = [
         _KugeciCandidate("wrong", "海闊天空", "許冠傑"),

@@ -25,12 +25,42 @@ formula_ffmpeg_path() {
 install_or_reinstall_formula() {
     local formula="$1"
     if brew list --versions "$formula" >/dev/null 2>&1; then
-        echo "正在重新安裝 $formula……"
+        echo "正在重新安裝 ${formula}……"
         brew reinstall "$formula"
     else
-        echo "正在安裝 $formula……"
+        echo "正在安裝 ${formula}……"
         brew install "$formula"
     fi
+}
+
+supported_js_runtime() {
+    local version=""
+    local major=""
+    local minor=""
+
+    if command -v deno >/dev/null 2>&1; then
+        version="$(deno --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+        major="${version%%.*}"
+        minor="${version#*.}"
+        minor="${minor%%.*}"
+        if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] \
+            && (( major > 2 || (major == 2 && minor >= 3) )); then
+            printf 'Deno %s\n' "$version"
+            return 0
+        fi
+    fi
+
+    if command -v node >/dev/null 2>&1; then
+        version="$(node --version 2>/dev/null)"
+        version="${version#v}"
+        major="${version%%.*}"
+        if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 22 )); then
+            printf 'Node.js %s\n' "$version"
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 pip_install_with_retry() {
@@ -41,7 +71,7 @@ pip_install_with_retry() {
     local retry_delay=5
 
     while true; do
-        echo "$description（第 $attempt/$max_attempts 次）……"
+        echo "${description}（第 ${attempt}/${max_attempts} 次）……"
         if "$VENV_PYTHON" -m pip install \
             --retries 10 \
             --timeout 60 \
@@ -129,10 +159,18 @@ fi
 export PATH="$(dirname "$FFMPEG_BIN"):$PATH"
 echo "FFmpeg 動態字幕支援已確認：$FFMPEG_BIN"
 
-if ! command -v deno >/dev/null 2>&1 && ! command -v node >/dev/null 2>&1; then
-    echo "正在安裝 Deno，供 YouTube 下載解算使用……"
-    brew install deno
+JS_RUNTIME="$(supported_js_runtime || true)"
+if [[ -z "$JS_RUNTIME" ]]; then
+    echo "搵唔到合規格嘅 Deno 2.3+ 或 Node.js 22+，正在安裝 Deno……"
+    install_or_reinstall_formula deno
+    JS_RUNTIME="$(supported_js_runtime || true)"
 fi
+if [[ -z "$JS_RUNTIME" ]]; then
+    echo "Deno 安裝完成後仍未能通過版本檢查。"
+    echo "請重新開啟終端機，執行 deno --version，確認版本為 2.3 或以上。"
+    exit 1
+fi
+echo "YouTube JavaScript 支援已確認：${JS_RUNTIME}"
 
 VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 if [[ ! -x "$VENV_PYTHON" ]]; then

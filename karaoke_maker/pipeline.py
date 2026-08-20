@@ -226,6 +226,11 @@ def _youtube_pipeline_error(exc: Exception, messages: list[str]) -> PipelineErro
             message = "Windows 無法解密所選瀏覽器嘅 cookies。請改用同一個 Windows 帳戶執行程式。"
         else:
             message = "macOS 無法讀取所選瀏覽器嘅 cookies。請允許終端機存取相關資料，或關閉 cookies 選項。"
+    elif "http error 429" in lowered or "too many requests" in lowered:
+        message = (
+            "YouTube 暫時限制咗目前網絡（HTTP 429）。請停止重試一段時間，"
+            "先用同一網絡喺瀏覽器完成 YouTube 驗證，再啟用該瀏覽器 cookies 重試一次。"
+        )
     elif any(
         marker in lowered
         for marker in (

@@ -30,6 +30,8 @@ K 歌工房 macOS 版
 
 如果 PyPI 暫時回傳 502／503，安裝器會增加 pip 連線重試及逾時時間，並將整個安裝步驟最多自動再試三次；無需立即改用另一個安裝檔。
 
+v0.5.1 已修正 macOS 系統內置 Bash 3.2 可能在安裝進度文字出現 `description: unbound variable` 的問題；安裝器亦會核對 Deno 2.3+ 或 Node.js 22+ 的實際版本，舊版本不會再被誤判為可用。
+
 Apple Silicon 會使用現行 PyTorch；Intel Mac 會自動使用最後提供 Intel macOS 預編譯套件的相容版本。兩種架構均可使用 FFmpeg 快速中心聲道模式。
 
 macOS 安全提示

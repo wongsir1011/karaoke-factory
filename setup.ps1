@@ -6,6 +6,33 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $ProjectDir
 
+function Get-SupportedJsRuntime {
+    $DenoCommand = Get-Command deno -ErrorAction SilentlyContinue
+    if ($DenoCommand) {
+        $DenoVersionLine = (& $DenoCommand.Source --version 2>$null | Select-Object -First 1)
+        if ($DenoVersionLine -match '^deno\s+(\d+)\.(\d+)') {
+            $DenoMajor = [int]$Matches[1]
+            $DenoMinor = [int]$Matches[2]
+            if ($DenoMajor -gt 2 -or ($DenoMajor -eq 2 -and $DenoMinor -ge 3)) {
+                return $DenoVersionLine
+            }
+        }
+    }
+
+    $NodeCommand = Get-Command node -ErrorAction SilentlyContinue
+    if ($NodeCommand) {
+        $NodeVersion = (& $NodeCommand.Source --version 2>$null | Select-Object -First 1)
+        if ($NodeVersion -match '^v?(\d+)\.') {
+            $NodeMajor = [int]$Matches[1]
+            if ($NodeMajor -ge 22) {
+                return "Node.js $NodeVersion"
+            }
+        }
+    }
+
+    return $null
+}
+
 $VenvPython = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $VenvPython)) {
     $PythonCommand = Get-Command python -ErrorAction SilentlyContinue
@@ -48,16 +75,26 @@ if ($LASTEXITCODE -ne 0) {
     throw "Package installation failed. Please check the network and try again."
 }
 
-$DenoCommand = Get-Command deno -ErrorAction SilentlyContinue
-$NodeCommand = Get-Command node -ErrorAction SilentlyContinue
-if ($DenoCommand) {
-    Write-Host "YouTube JavaScript support: Deno detected." -ForegroundColor Green
+$JsRuntime = Get-SupportedJsRuntime
+if (-not $JsRuntime) {
+    $WingetCommand = Get-Command winget -ErrorAction SilentlyContinue
+    if ($WingetCommand) {
+        Write-Host "Installing Deno 2.3+ for reliable YouTube downloads..." -ForegroundColor Cyan
+        & $WingetCommand.Source install --id DenoLand.Deno --exact --accept-package-agreements --accept-source-agreements
+        if ($LASTEXITCODE -eq 0) {
+            $MachinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $env:Path = "$MachinePath;$UserPath"
+            $JsRuntime = Get-SupportedJsRuntime
+        }
+    }
 }
-elseif ($NodeCommand) {
-    Write-Host "YouTube JavaScript support: Node.js detected." -ForegroundColor Green
+
+if ($JsRuntime) {
+    Write-Host "YouTube JavaScript support ready: $JsRuntime" -ForegroundColor Green
 }
 else {
-    Write-Warning "YouTube downloads need Deno 2.3+ or Node.js 22+. Install one of them for reliable downloads."
+    Write-Warning "YouTube downloads need Deno 2.3+ or Node.js 22+. Run: winget install DenoLand.Deno"
 }
 
 if ($WithAI) {
