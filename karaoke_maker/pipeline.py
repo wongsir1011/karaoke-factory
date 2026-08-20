@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import unicodedata
@@ -12,13 +13,29 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlparse
 
 import requests
+import truststore
+from requests.adapters import HTTPAdapter
 
-from .lyrics import LyricLine, lyrics_from_text, write_ass
+from .lyrics import (
+    LyricLine,
+    has_lrc_timestamps,
+    lyrics_from_text,
+    to_traditional_chinese,
+    write_ass,
+)
+from .lyric_timing import (
+    SuggestedLyricLine,
+    align_lyrics_to_transcript,
+    plain_lyric_lines,
+    transcript_tokens_from_segments,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -36,13 +53,16 @@ ProgressCallback = Callable[[str, float, str], None]
 
 
 class PipelineError(RuntimeError):
-    pass
+    def __init__(self, message: str, technical_details: str = "") -> None:
+        super().__init__(message)
+        self.technical_details = technical_details
 
 
 @dataclass(frozen=True)
 class JobSettings:
     source_type: Literal["youtube", "upload"]
     youtube_url: str = ""
+    youtube_cookie_browser: Literal["none", "chrome", "edge", "firefox"] = "none"
     upload_name: str = ""
     upload_bytes: bytes | None = None
     lyrics_source: Literal["auto", "lrc", "paste"] = "auto"
@@ -55,6 +75,7 @@ class JobSettings:
     font_name: str = "Microsoft JhengHei"
     font_size: int = 64
     highlight_color: str = "#FFC928"
+    prepared_instrumental_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -63,6 +84,22 @@ class SourceInfo:
     title: str
     artist: str
     duration: float
+
+
+@dataclass(frozen=True)
+class LyricsLookup:
+    lyrics: str
+    track: str
+    artist: str
+    source: Literal["Kugeci", "LRCLIB"]
+    source_url: str
+
+
+@dataclass(frozen=True)
+class _KugeciCandidate:
+    song_id: str
+    track: str
+    artist: str
 
 
 @dataclass(frozen=True)
@@ -76,8 +113,31 @@ class PipelineResult:
     separation_mode: str
 
 
+@dataclass(frozen=True)
+class LyricsTimingResult:
+    analysis_id: str
+    preview_path: Path
+    instrumental_path: Path
+    lines: tuple[SuggestedLyricLine, ...]
+    duration: float
+    title: str
+    artist: str
+    language: str
+    model_name: str
+
+    @property
+    def average_confidence(self) -> float:
+        if not self.lines:
+            return 0.0
+        return sum(line.confidence for line in self.lines) / len(self.lines)
+
+
 def ai_separation_available() -> bool:
     return importlib.util.find_spec("demucs") is not None
+
+
+def ai_lyric_timing_available() -> bool:
+    return ai_separation_available() and importlib.util.find_spec("whisper") is not None
 
 
 def _report(callback: ProgressCallback | None, stage: str, value: float, message: str) -> None:
@@ -106,6 +166,158 @@ def _validate_youtube_url(url: str) -> None:
         raise PipelineError("請輸入有效嘅 YouTube 或 youtu.be 連結。")
 
 
+class _YoutubeLogger:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def _remember(self, message: object) -> None:
+        text = str(message).strip()
+        if text:
+            self.messages.append(text)
+
+    def debug(self, message: object) -> None:
+        # yt-dlp sends normal console output through debug(); progress is already
+        # handled separately, so only retain warnings and errors for diagnosis.
+        if str(message).lstrip().startswith(("WARNING:", "ERROR:")):
+            self._remember(message)
+
+    def info(self, message: object) -> None:
+        return None
+
+    def warning(self, message: object) -> None:
+        self._remember(f"WARNING: {message}")
+
+    def error(self, message: object) -> None:
+        self._remember(f"ERROR: {message}")
+
+
+def _sanitize_download_diagnostics(messages: list[str]) -> str:
+    text = "\n".join(messages)
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    replacements = {
+        str(Path.home()): "%USERPROFILE%",
+        str(BASE_DIR): "%PROJECT_DIR%",
+    }
+    for original, replacement in replacements.items():
+        text = text.replace(original, replacement)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-30:])[-4_000:]
+
+
+def _youtube_pipeline_error(exc: Exception, messages: list[str]) -> PipelineError:
+    diagnostics = _sanitize_download_diagnostics([*messages, str(exc)])
+    lowered = diagnostics.lower()
+
+    if "certificate_verify_failed" in lowered or "certificate verify failed" in lowered:
+        if os.name == "nt":
+            message = (
+                "YouTube 安全連線憑證驗證失敗。程式已使用 Windows 系統憑證庫；"
+                "請檢查防毒軟件、公司網絡或代理伺服器嘅 HTTPS 掃描設定。"
+            )
+        else:
+            message = (
+                "YouTube 安全連線憑證驗證失敗。請確認 macOS 日期時間正確，"
+                "並檢查防毒軟件、公司網絡或代理伺服器嘅 HTTPS 掃描設定。"
+            )
+    elif "could not copy" in lowered and "cookie" in lowered:
+        message = "讀取瀏覽器 cookies 失敗。請完全關閉所選瀏覽器後再試，或者關閉 cookies 選項。"
+    elif "failed to decrypt" in lowered and "cookie" in lowered:
+        if os.name == "nt":
+            message = "Windows 無法解密所選瀏覽器嘅 cookies。請改用同一個 Windows 帳戶執行程式。"
+        else:
+            message = "macOS 無法讀取所選瀏覽器嘅 cookies。請允許終端機存取相關資料，或關閉 cookies 選項。"
+    elif "http error 429" in lowered or "too many requests" in lowered:
+        message = (
+            "YouTube 暫時限制咗目前網絡（HTTP 429）。請停止重試一段時間，"
+            "先用同一網絡喺瀏覽器完成 YouTube 驗證，再啟用該瀏覽器 cookies 重試一次。"
+        )
+    elif any(
+        marker in lowered
+        for marker in (
+            "sign in to confirm",
+            "sign in to confirm you're not a bot",
+            "login required",
+            "authentication required",
+        )
+    ):
+        message = (
+            "YouTube 要求登入或驗證你唔係機械人。請展開「下載有困難？」、啟用瀏覽器 cookies，"
+            "再選擇你已登入 YouTube 嘅瀏覽器。"
+        )
+    elif "private video" in lowered:
+        message = "呢段係私人影片；只有獲授權並已登入嘅帳戶先可以存取。"
+    elif "members-only" in lowered:
+        message = "呢段係會員專屬影片；請確認帳戶有觀看權限並啟用瀏覽器 cookies。"
+    elif "age-restricted" in lowered or "confirm your age" in lowered:
+        message = "呢段影片有年齡限制；請啟用已登入 YouTube 嘅瀏覽器 cookies。"
+    elif any(marker in lowered for marker in ("not available in your country", "geo restricted")):
+        message = "呢段影片受地區限制，目前網絡位置無法存取。"
+    elif any(
+        marker in lowered
+        for marker in (
+            "http error 403",
+            "po token",
+            "signature solving failed",
+            "n challenge solving failed",
+            "requested format is not available",
+        )
+    ):
+        message = (
+            "YouTube 拒絕咗影片格式請求。請重新執行 .\\setup.ps1 更新 EJS 支援後再試；"
+            "如影片要求登入，再啟用瀏覽器 cookies。"
+        )
+    elif any(marker in lowered for marker in ("timed out", "temporary failure", "connection reset")):
+        message = "連接 YouTube 逾時或中斷。程式已自動重試；請檢查網絡後再試。"
+    elif "video unavailable" in lowered:
+        message = "YouTube 顯示影片無法播放；影片可能已下架、設為私人或限制咗所在地區。"
+    else:
+        message = "YouTube 下載失敗。請展開技術資料查看實際原因，或者改用本機影片。"
+
+    return PipelineError(message, diagnostics)
+
+
+def _youtube_options(
+    *,
+    job_dir: Path,
+    max_height: int,
+    cookie_browser: str,
+    progress_hook: Callable[[dict[str, object]], None],
+    logger: _YoutubeLogger,
+) -> dict[str, object]:
+    options: dict[str, object] = {
+        "format": f"bv*[height<={max_height}]+ba/b[height<={max_height}]/best",
+        "outtmpl": str(job_dir / "source.%(ext)s"),
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": False,
+        "logger": logger,
+        "ffmpeg_location": str(_ffmpeg_path()),
+        "progress_hooks": [progress_hook],
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "file_access_retries": 3,
+        "retry_sleep_functions": {
+            "http": lambda attempt: min(2 ** max(0, attempt - 1), 10),
+            "fragment": lambda attempt: min(2 ** max(0, attempt - 1), 10),
+            "extractor": lambda attempt: min(attempt * 2, 10),
+        },
+        "socket_timeout": 20,
+        "concurrent_fragment_downloads": 4,
+        "continuedl": True,
+        "windowsfilenames": True,
+        "js_runtimes": {"deno": {}, "node": {}},
+    }
+    if os.name == "nt":
+        # Prefer the Windows trust store so HTTPS inspection certificates trusted
+        # by the operating system also work without disabling TLS verification.
+        options["compat_opts"] = {"no-certifi"}
+    if cookie_browser in {"chrome", "edge", "firefox"}:
+        options["cookiesfrombrowser"] = (cookie_browser, None, None, None)
+    return options
+
+
 def _ffmpeg_path() -> Path:
     system = shutil.which("ffmpeg")
     if system:
@@ -118,6 +330,49 @@ def _ffmpeg_path() -> Path:
         raise PipelineError(
             "搵唔到 FFmpeg。請先執行 .\\setup.ps1 安裝所需套件。"
         ) from exc
+
+
+def _ffmpeg_filter_available(filter_name: str) -> bool:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    process = subprocess.run(
+        [str(_ffmpeg_path()), "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+        check=False,
+    )
+    if process.returncode != 0:
+        return False
+    for line in process.stdout.splitlines():
+        columns = line.split()
+        if len(columns) >= 2 and columns[1] == filter_name:
+            return True
+    return False
+
+
+def _ensure_subtitle_rendering_support() -> None:
+    if _ffmpeg_filter_available("ass"):
+        return
+
+    ffmpeg = _ffmpeg_path()
+    if sys.platform == "darwin":
+        message = (
+            "目前嘅 FFmpeg 冇包含 ASS 動態字幕濾鏡。請關閉程式，重新雙擊 "
+            "`setup.command`；新版安裝程式會安裝包含字幕支援嘅 FFmpeg，之後再試。"
+        )
+    elif os.name == "nt":
+        message = (
+            "目前嘅 FFmpeg 冇包含 ASS 動態字幕濾鏡。請關閉程式，重新執行 "
+            "`.\\setup.ps1` 後再試。"
+        )
+    else:
+        message = "目前嘅 FFmpeg 冇包含 ASS 動態字幕濾鏡；請安裝啟用 libass 嘅 FFmpeg。"
+    raise PipelineError(
+        message,
+        technical_details=f"FFmpeg missing required filter: ass ({ffmpeg})",
+    )
 
 
 def _run_command(command: list[str], *, description: str) -> str:
@@ -160,6 +415,7 @@ def _download_youtube(
     url: str,
     job_dir: Path,
     max_height: int,
+    cookie_browser: str,
     callback: ProgressCallback | None,
 ) -> SourceInfo:
     _validate_youtube_url(url)
@@ -179,28 +435,20 @@ def _download_youtube(
         elif event.get("status") == "finished":
             _report(callback, "download", 0.25, "MV 下載完成，正在合併音畫…")
 
-    output_template = str(job_dir / "source.%(ext)s")
-    options = {
-        "format": f"bv*[height<={max_height}]+ba/b[height<={max_height}]/best",
-        "outtmpl": output_template,
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "ffmpeg_location": str(_ffmpeg_path()),
-        "progress_hooks": [progress_hook],
-        "retries": 3,
-        "fragment_retries": 3,
-        "windowsfilenames": True,
-    }
+    logger = _YoutubeLogger()
+    options = _youtube_options(
+        job_dir=job_dir,
+        max_height=max_height,
+        cookie_browser=cookie_browser,
+        progress_hook=progress_hook,
+        logger=logger,
+    )
 
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
             info = downloader.extract_info(url.strip(), download=True)
     except Exception as exc:
-        raise PipelineError(
-            "YouTube 下載失敗。影片可能受地區／年齡限制、係私人影片，或者 YouTube 已更改下載方式。"
-        ) from exc
+        raise _youtube_pipeline_error(exc, logger.messages) from exc
 
     candidates = [
         path
@@ -211,6 +459,65 @@ def _download_youtube(
         raise PipelineError("下載完成但搵唔到影片檔案。")
     source_path = next((path for path in candidates if path.suffix.lower() == ".mp4"), candidates[0])
     title = str(info.get("track") or info.get("title") or "YouTube MV")
+    artist = str(info.get("artist") or info.get("creator") or info.get("uploader") or "")
+    duration = float(info.get("duration") or 0) or _probe_duration(source_path)
+    return SourceInfo(source_path, title, artist, duration)
+
+
+def _download_youtube_audio(
+    url: str,
+    job_dir: Path,
+    cookie_browser: str,
+    callback: ProgressCallback | None,
+) -> SourceInfo:
+    """Download only the audio needed for lyric timing, not the full MV."""
+    _validate_youtube_url(url)
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise PipelineError("未安裝 yt-dlp；請先執行安裝程式。") from exc
+
+    _report(callback, "download", 0.03, "正在連接 YouTube 並準備音訊…")
+
+    def progress_hook(event: dict[str, object]) -> None:
+        if event.get("status") == "downloading":
+            downloaded = float(event.get("downloaded_bytes") or 0)
+            total = float(event.get("total_bytes") or event.get("total_bytes_estimate") or 0)
+            fraction = downloaded / total if total else 0.1
+            _report(callback, "download", 0.03 + fraction * 0.17, "正在下載分析用音訊…")
+        elif event.get("status") == "finished":
+            _report(callback, "download", 0.20, "音訊下載完成。")
+
+    logger = _YoutubeLogger()
+    options = _youtube_options(
+        job_dir=job_dir,
+        max_height=720,
+        cookie_browser=cookie_browser,
+        progress_hook=progress_hook,
+        logger=logger,
+    )
+    options.update(
+        {
+            "format": "ba/b",
+            "outtmpl": str(job_dir / "timing_source.%(ext)s"),
+        }
+    )
+
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info = downloader.extract_info(url.strip(), download=True)
+    except Exception as exc:
+        raise _youtube_pipeline_error(exc, logger.messages) from exc
+
+    candidates = [
+        path
+        for path in job_dir.glob("timing_source.*")
+        if path.is_file() and path.suffix.lower() not in {".part", ".ytdl", ".json"}
+    ]
+    if not candidates:
+        raise PipelineError("下載完成但搵唔到分析用音訊。")
+    source_path = candidates[0]
+    title = str(info.get("track") or info.get("title") or "YouTube 音訊")
     artist = str(info.get("artist") or info.get("creator") or info.get("uploader") or "")
     duration = float(info.get("duration") or 0) or _probe_duration(source_path)
     return SourceInfo(source_path, title, artist, duration)
@@ -256,6 +563,27 @@ def _extract_audio(source: Path, output: Path) -> None:
     )
 
 
+def _encode_audio_preview(source: Path, output: Path) -> None:
+    _run_command(
+        [
+            str(_ffmpeg_path()),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "160k",
+            str(output),
+        ],
+        description="建立歌詞校正預覽音訊",
+    )
+
+
 def _center_channel_remove(mixture: Path, instrumental: Path) -> None:
     _run_command(
         [
@@ -276,25 +604,308 @@ def _center_channel_remove(mixture: Path, instrumental: Path) -> None:
     )
 
 
-def _demucs_separate(mixture: Path, instrumental: Path) -> Path:
+def _demucs_separate(
+    mixture: Path,
+    instrumental: Path,
+    vocals: Path | None = None,
+) -> Path:
     if not ai_separation_available():
         raise PipelineError(
             "未安裝 Demucs AI 套件。請關閉程式後執行 `.\\setup.ps1 -WithAI`，"
             "或者改用「快速中心聲道」模式。"
         )
+    command = [
+        sys.executable,
+        "-m",
+        "karaoke_maker.demucs_runner",
+        str(mixture),
+        str(instrumental),
+    ]
+    if vocals is not None:
+        command.extend(["--vocals-output", str(vocals)])
     _run_command(
-        [
-            sys.executable,
-            "-m",
-            "karaoke_maker.demucs_runner",
-            str(mixture),
-            str(instrumental),
-        ],
+        command,
         description="AI 人聲分離",
     )
     if not instrumental.exists():
         raise PipelineError("Demucs 已完成，但搵唔到無人聲音軌。")
+    if vocals is not None and not vocals.exists():
+        raise PipelineError("Demucs 已完成，但搵唔到主唱音軌。")
     return instrumental
+
+
+@lru_cache(maxsize=1)
+def _load_whisper_model(model_name: str) -> tuple[object, str]:
+    try:
+        import torch
+        import whisper
+    except ImportError as exc:
+        raise PipelineError(
+            "未安裝 AI 歌詞對時套件。請關閉程式後執行 install-ai 安裝程式。"
+        ) from exc
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_dir = BASE_DIR / "work" / "models" / "whisper"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        model = whisper.load_model(
+            model_name,
+            device=device,
+            download_root=str(model_dir),
+        )
+    except Exception as exc:
+        raise PipelineError(
+            "下載或載入歌聲辨認模型失敗。請檢查網絡及可用磁碟空間後再試。",
+            technical_details=f"{type(exc).__name__}: {exc}",
+        ) from exc
+    return model, device
+
+
+def _transcribe_vocals(
+    vocals: Path,
+    language: Literal["cantonese", "mandarin", "auto"],
+    model_name: Literal["small", "turbo"],
+) -> list[dict[str, object]]:
+    model, device = _load_whisper_model(model_name)
+    language_code: str | None
+    if language == "cantonese":
+        # The dedicated Cantonese token was added with large-v3/turbo. The
+        # smaller multilingual model uses the broader Chinese token.
+        language_code = "yue" if model_name == "turbo" else "zh"
+    elif language == "mandarin":
+        language_code = "zh"
+    else:
+        language_code = None
+
+    try:
+        result = model.transcribe(  # type: ignore[attr-defined]
+            str(vocals),
+            task="transcribe",
+            language=language_code,
+            word_timestamps=True,
+            fp16=device == "cuda",
+            temperature=0,
+            condition_on_previous_text=True,
+        )
+    except Exception as exc:
+        raise PipelineError(
+            "AI 未能完成歌聲辨認。可嘗試改用較準確模式，或者檢查歌曲係咪有太多和音／現場雜聲。",
+            technical_details=f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+    if not isinstance(result, dict):
+        return []
+    segments = result.get("segments")
+    if not isinstance(segments, list):
+        return []
+    return [segment for segment in segments if isinstance(segment, dict)]
+
+
+def prepare_lyrics_timing(
+    settings: JobSettings,
+    lyrics_text: str,
+    *,
+    language: Literal["cantonese", "mandarin", "auto"] = "cantonese",
+    model_name: Literal["small", "turbo"] = "small",
+    callback: ProgressCallback | None = None,
+) -> LyricsTimingResult:
+    """Create editable sentence-level timing suggestions from a song's vocals."""
+    if not ai_lyric_timing_available():
+        raise PipelineError(
+            "AI 歌詞對時尚未安裝。請關閉程式後執行 install-ai 安裝程式。"
+        )
+    if not plain_lyric_lines(lyrics_text):
+        raise PipelineError("請先貼上至少一句普通歌詞。")
+    if language not in {"cantonese", "mandarin", "auto"}:
+        raise PipelineError("歌詞語言設定無效。")
+    if model_name not in {"small", "turbo"}:
+        raise PipelineError("AI 分析模式設定無效。")
+
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    analysis_id = uuid.uuid4().hex
+    job_dir = WORK_DIR / f"lyrics-{analysis_id}"
+    job_dir.mkdir(parents=True)
+    succeeded = False
+
+    try:
+        if settings.source_type == "youtube":
+            source = _download_youtube_audio(
+                settings.youtube_url,
+                job_dir,
+                settings.youtube_cookie_browser,
+                callback,
+            )
+        else:
+            _report(callback, "source", 0.05, "正在讀取上載影片音訊…")
+            source = _save_upload(settings, job_dir)
+
+        _report(callback, "audio", 0.22, "正在準備分析用音軌…")
+        mixture = job_dir / "mixture.wav"
+        _extract_audio(source.path, mixture)
+        preview = job_dir / "preview.mp3"
+        _encode_audio_preview(mixture, preview)
+
+        vocals = job_dir / "vocals.wav"
+        _report(callback, "separate", 0.30, "AI 正在抽出主唱聲；首次會下載模型…")
+        _demucs_separate(mixture, job_dir / "instrumental.wav", vocals)
+
+        _report(callback, "transcribe", 0.62, "AI 正在聆聽主唱及辨認演唱位置…")
+        segments = _transcribe_vocals(vocals, language, model_name)
+        tokens = transcript_tokens_from_segments(segments)
+
+        _report(callback, "align", 0.88, "正在將已確認歌詞逐句配對時間…")
+        lines = align_lyrics_to_transcript(lyrics_text, tokens, source.duration)
+        if not lines:
+            raise PipelineError("歌詞入面搵唔到可以對時嘅句子。")
+
+        instrumental = job_dir / "instrumental.wav"
+        for disposable in (source.path, mixture, vocals):
+            if disposable != preview:
+                try:
+                    disposable.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        _report(callback, "done", 1.0, "AI 句級歌詞對時完成，請逐句覆核。")
+        succeeded = True
+        return LyricsTimingResult(
+            analysis_id=analysis_id,
+            preview_path=preview,
+            instrumental_path=instrumental,
+            lines=tuple(lines),
+            duration=source.duration,
+            title=settings.track_name.strip() or _normalise_title(source.title),
+            artist=settings.artist_name.strip() or source.artist.strip(),
+            language=language,
+            model_name=model_name,
+        )
+    finally:
+        if not succeeded:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def discard_lyrics_timing(result: LyricsTimingResult | None) -> None:
+    """Remove retained preview/separation files for a completed timing analysis."""
+    if result is None:
+        return
+    try:
+        work_root = WORK_DIR.resolve()
+        analysis_dir = result.preview_path.parent.resolve()
+        relative = analysis_dir.relative_to(work_root)
+    except (OSError, ValueError):
+        return
+    if relative.parts != (f"lyrics-{result.analysis_id}",):
+        return
+    shutil.rmtree(analysis_dir, ignore_errors=True)
+
+
+def _prepared_instrumental(settings: JobSettings) -> Path | None:
+    raw_path = settings.prepared_instrumental_path.strip()
+    if not raw_path:
+        return None
+    try:
+        work_root = WORK_DIR.resolve()
+        candidate = Path(raw_path).resolve()
+        relative = candidate.relative_to(work_root)
+    except (OSError, ValueError):
+        return None
+    if (
+        len(relative.parts) != 2
+        or not relative.parts[0].startswith("lyrics-")
+        or relative.parts[1] != "instrumental.wav"
+        or not candidate.is_file()
+    ):
+        return None
+    return candidate
+
+
+class _NativeTrustAdapter(HTTPAdapter):
+    """Use the OS trust store while keeping certificate verification enabled."""
+
+    def init_poolmanager(self, *args: object, **kwargs: object) -> None:
+        kwargs["ssl_context"] = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        super().init_poolmanager(*args, **kwargs)
+
+    def cert_verify(
+        self,
+        conn: object,
+        url: str,
+        verify: bool | str,
+        cert: object,
+    ) -> None:
+        # Requests normally replaces the adapter context with certifi. The
+        # truststore context above already enforces hostname and CA checks via
+        # Windows CryptoAPI or the macOS Security framework.
+        if not verify:
+            raise ValueError("Native trust requests must verify TLS certificates")
+        setattr(conn, "cert_reqs", "CERT_REQUIRED")
+
+
+class _KugeciSearchParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.candidates: list[_KugeciCandidate] = []
+        self._row_links: list[tuple[str, str]] | None = None
+        self._active_href: str | None = None
+        self._active_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "tr":
+            self._row_links = []
+        elif tag == "a" and self._row_links is not None:
+            self._active_href = dict(attrs).get("href") or ""
+            self._active_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._active_href is not None:
+            self._active_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._active_href is not None:
+            text = re.sub(r"\s+", " ", "".join(self._active_text)).strip()
+            if self._row_links is not None:
+                self._row_links.append((self._active_href, text))
+            self._active_href = None
+            self._active_text = []
+        elif tag == "tr" and self._row_links is not None:
+            song_link = next(
+                (
+                    (href, text)
+                    for href, text in self._row_links
+                    if text and re.search(r"/song/[A-Za-z0-9]+/?$", href)
+                ),
+                None,
+            )
+            if song_link:
+                song_id = urlparse(song_link[0]).path.rstrip("/").rsplit("/", 1)[-1]
+                artists = [
+                    text
+                    for href, text in self._row_links
+                    if text and "/singer/" in urlparse(href).path
+                ]
+                self.candidates.append(
+                    _KugeciCandidate(
+                        song_id=song_id,
+                        track=song_link[1],
+                        artist=" ".join(dict.fromkeys(artists)),
+                    )
+                )
+            self._row_links = None
+
+
+def _native_trust_session() -> requests.Session:
+    session = requests.Session()
+    session.mount("https://", _NativeTrustAdapter())
+    return session
+
+
+def _decode_lyric_bytes(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "big5", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def _normalise_title(title: str) -> str:
@@ -315,42 +926,181 @@ def _lyric_score(item: dict[str, object], track: str, artist: str, duration: flo
     return score
 
 
-def _fetch_synced_lyrics(track: str, artist: str, duration: float) -> str:
-    params = {"track_name": track}
-    if artist:
-        params["artist_name"] = artist
-    try:
-        response = requests.get(
-            "https://lrclib.net/api/search",
-            params=params,
-            headers={"User-Agent": "KaraokeWorkshop/1.0 (local personal-use app)"},
+def _lookup_key(value: str) -> str:
+    value = to_traditional_chinese(unicodedata.normalize("NFKC", value)).casefold()
+    return re.sub(r"[^\w\u3400-\u9fff]+", "", value)
+
+
+def _lookup_similarity(left: str, right: str) -> float:
+    left_key = _lookup_key(left)
+    right_key = _lookup_key(right)
+    if not left_key or not right_key:
+        return 0.0
+    if left_key in right_key or right_key in left_key:
+        return 1.0
+    return SequenceMatcher(None, left_key, right_key).ratio()
+
+
+def _select_kugeci_candidate(
+    candidates: list[_KugeciCandidate],
+    track: str,
+    artist: str,
+) -> _KugeciCandidate | None:
+    scored: list[tuple[float, float, float, _KugeciCandidate]] = []
+    for candidate in candidates:
+        track_score = _lookup_similarity(candidate.track, track)
+        artist_score = _lookup_similarity(candidate.artist, artist) if artist else 1.0
+        scored.append(
+            (track_score * 4 + artist_score * 2, track_score, artist_score, candidate)
+        )
+
+    if not scored:
+        return None
+    _, track_score, artist_score, best = max(scored, key=lambda item: item[0])
+    if track_score < 0.70 or (artist and artist_score < 0.40):
+        return None
+    return best
+
+
+def _fetch_kugeci_synced_lyrics(track: str, artist: str) -> LyricsLookup | None:
+    headers = {
+        "User-Agent": "KaraokeFactory/1.0 (local personal-use app)",
+        "Accept-Language": "zh-HK,zh-TW;q=0.9,zh;q=0.8,en;q=0.5",
+    }
+    with _native_trust_session() as session:
+        response = session.get(
+            "https://www.kugeci.com/search",
+            params={"q": track},
+            headers=headers,
             timeout=20,
         )
         response.raise_for_status()
-        payload = response.json()
-    except (requests.RequestException, json.JSONDecodeError) as exc:
-        raise PipelineError("連接同步歌詞服務失敗；請改為上載 LRC 歌詞。") from exc
+        response.encoding = "utf-8"
 
-    choices = [item for item in payload if item.get("syncedLyrics")]
-    if not choices:
-        raise PipelineError(
-            f"搵唔到「{track}」嘅同步歌詞。請上載有時間碼嘅 LRC 檔案。"
+        parser = _KugeciSearchParser()
+        parser.feed(response.text)
+        candidate = _select_kugeci_candidate(parser.candidates, track, artist)
+        if candidate is None:
+            return None
+
+        lyric_response = session.get(
+            f"https://www.kugeci.com/download/lrc/{candidate.song_id}",
+            headers=headers,
+            timeout=20,
         )
+        lyric_response.raise_for_status()
+
+    lyric_text = _decode_lyric_bytes(lyric_response.content).strip()
+    if not has_lrc_timestamps(lyric_text):
+        return None
+    return LyricsLookup(
+        lyrics=lyric_text,
+        track=candidate.track,
+        artist=candidate.artist,
+        source="Kugeci",
+        source_url=f"https://www.kugeci.com/song/{candidate.song_id}",
+    )
+
+
+def _fetch_lrclib_synced_lyrics(
+    track: str,
+    artist: str,
+    duration: float,
+) -> LyricsLookup | None:
+    params = {"track_name": track}
+    if artist:
+        params["artist_name"] = artist
+    with _native_trust_session() as session:
+        response = session.get(
+            "https://lrclib.net/api/search",
+            params=params,
+            headers={"User-Agent": "KaraokeFactory/1.0 (local personal-use app)"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise requests.RequestException("LRCLIB returned invalid JSON") from exc
+
+    if not isinstance(payload, list):
+        raise requests.RequestException("LRCLIB returned an unexpected response")
+    choices = [
+        item
+        for item in payload
+        if isinstance(item, dict) and item.get("syncedLyrics")
+    ]
+    if not choices:
+        return None
     best = max(choices, key=lambda item: _lyric_score(item, track, artist, duration))
-    return str(best["syncedLyrics"])
+    return LyricsLookup(
+        lyrics=str(best["syncedLyrics"]),
+        track=str(best.get("trackName") or track),
+        artist=str(best.get("artistName") or artist),
+        source="LRCLIB",
+        source_url="https://lrclib.net/",
+    )
+
+
+def lookup_synced_lyrics(
+    track: str,
+    artist: str = "",
+    duration: float = 0.0,
+) -> LyricsLookup:
+    track = track.strip()
+    artist = artist.strip()
+    if not track:
+        raise PipelineError("自動搵歌詞前，請先填寫歌名。")
+
+    failures: list[str] = []
+    try:
+        kugeci_result = _fetch_kugeci_synced_lyrics(track, artist)
+    except (requests.RequestException, OSError, ssl.SSLError) as exc:
+        failures.append(f"Kugeci: {type(exc).__name__}: {exc}")
+    else:
+        if kugeci_result is not None:
+            return kugeci_result
+
+    try:
+        lrclib_result = _fetch_lrclib_synced_lyrics(track, artist, duration)
+    except (requests.RequestException, OSError, ssl.SSLError) as exc:
+        failures.append(f"LRCLIB: {type(exc).__name__}: {exc}")
+    else:
+        if lrclib_result is not None:
+            return lrclib_result
+
+    details = "\n".join(failures)
+    raise PipelineError(
+        f"Kugeci 同後備同步歌詞服務都搵唔到「{track}」。"
+        "請改用「上載 LRC」或「貼上歌詞」。",
+        technical_details=details,
+    )
+
+
+def _fetch_synced_lyrics(track: str, artist: str, duration: float) -> str:
+    return lookup_synced_lyrics(track, artist, duration).lyrics
 
 
 def _prepare_lyrics(
     settings: JobSettings,
     source: SourceInfo,
+    lookup: LyricsLookup | None = None,
 ) -> tuple[list[LyricLine], bool, str, str]:
-    track = settings.track_name.strip() or _normalise_title(source.title)
-    artist = settings.artist_name.strip() or source.artist.strip()
+    track = (
+        settings.track_name.strip()
+        or (lookup.track if lookup else "")
+        or _normalise_title(source.title)
+    )
+    artist = (
+        settings.artist_name.strip()
+        or (lookup.artist if lookup else "")
+        or source.artist.strip()
+    )
 
     if settings.lyrics_source == "auto":
-        if not track:
-            raise PipelineError("自動搵歌詞需要歌名。")
-        lyric_text = _fetch_synced_lyrics(track, artist, source.duration)
+        if lookup is None:
+            raise PipelineError("未確認同步歌詞，程式唔會開始下載或分離影片。")
+        lyric_text = lookup.lyrics
     else:
         lyric_text = settings.lyrics_text.strip()
         if not lyric_text:
@@ -414,6 +1164,23 @@ def run_pipeline(
     settings: JobSettings,
     callback: ProgressCallback | None = None,
 ) -> PipelineResult:
+    lyrics_lookup: LyricsLookup | None = None
+    if settings.lyrics_source == "auto":
+        _report(callback, "lyrics", 0.01, "先到 Kugeci 搜尋同步歌詞…")
+        lyrics_lookup = lookup_synced_lyrics(
+            settings.track_name,
+            settings.artist_name,
+        )
+        _report(
+            callback,
+            "lyrics",
+            0.02,
+            f"已從 {lyrics_lookup.source} 找到同步歌詞，準備影片…",
+        )
+
+    _report(callback, "system", 0.03, "正在檢查動態字幕支援…")
+    _ensure_subtitle_rendering_support()
+
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     job_dir = WORK_DIR / uuid.uuid4().hex
@@ -426,26 +1193,41 @@ def run_pipeline(
                 settings.youtube_url,
                 job_dir,
                 settings.max_height,
+                settings.youtube_cookie_browser,
                 callback,
             )
         else:
             _report(callback, "source", 0.05, "正在讀取上載影片…")
             source = _save_upload(settings, job_dir)
 
-        _report(callback, "audio", 0.30, "正在抽取高質音軌…")
-        mixture = job_dir / "mixture.wav"
-        _extract_audio(source.path, mixture)
+        prepared_instrumental = (
+            _prepared_instrumental(settings)
+            if settings.separation_mode == "ai"
+            else None
+        )
+        if prepared_instrumental is not None:
+            _report(callback, "separate", 0.62, "正在重用歌詞對時已分離嘅伴奏音軌…")
+            instrumental = job_dir / "instrumental.wav"
+            shutil.copy2(prepared_instrumental, instrumental)
+        else:
+            _report(callback, "audio", 0.30, "正在抽取高質音軌…")
+            mixture = job_dir / "mixture.wav"
+            _extract_audio(source.path, mixture)
 
-        if settings.separation_mode == "ai":
+        if settings.separation_mode == "ai" and prepared_instrumental is None:
             _report(callback, "separate", 0.38, "AI 正在分離人聲；首次會下載模型…")
             instrumental = _demucs_separate(mixture, job_dir / "instrumental.wav")
-        else:
+        elif settings.separation_mode == "center":
             _report(callback, "separate", 0.42, "正在消除中心聲道人聲…")
             instrumental = job_dir / "instrumental.wav"
             _center_channel_remove(mixture, instrumental)
 
-        _report(callback, "lyrics", 0.68, "正在準備同步歌詞…")
-        lyric_lines, timing_estimated, track, artist = _prepare_lyrics(settings, source)
+        _report(callback, "lyrics", 0.68, "正在套用已確認嘅同步歌詞…")
+        lyric_lines, timing_estimated, track, artist = _prepare_lyrics(
+            settings,
+            source,
+            lyrics_lookup,
+        )
         subtitle_path = job_dir / "karaoke.ass"
         write_ass(
             subtitle_path,

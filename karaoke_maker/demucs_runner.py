@@ -42,7 +42,12 @@ def save_pcm_wav(path: Path, audio: torch.Tensor, sample_rate: int) -> None:
         handle.writeframes(pcm)
 
 
-def separate(mixture_path: Path, output_path: Path, model_name: str = "htdemucs") -> None:
+def separate(
+    mixture_path: Path,
+    output_path: Path,
+    model_name: str = "htdemucs",
+    vocals_output_path: Path | None = None,
+) -> None:
     model = get_model(model_name)
     model.cpu()
     model.eval()
@@ -78,6 +83,9 @@ def separate(mixture_path: Path, output_path: Path, model_name: str = "htdemucs"
         if name != "vocals":
             instrumental += sources[index]
     save_pcm_wav(output_path, instrumental, model.samplerate)
+    if vocals_output_path is not None:
+        vocals_index = model.sources.index("vocals")
+        save_pcm_wav(vocals_output_path, sources[vocals_index], model.samplerate)
 
 
 def main() -> None:
@@ -85,8 +93,14 @@ def main() -> None:
     parser.add_argument("mixture", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--model", default="htdemucs")
+    parser.add_argument("--vocals-output", type=Path)
     args = parser.parse_args()
-    separate(args.mixture, args.output, args.model)
+    separate(
+        args.mixture,
+        args.output,
+        args.model,
+        vocals_output_path=args.vocals_output,
+    )
 
 
 if __name__ == "__main__":

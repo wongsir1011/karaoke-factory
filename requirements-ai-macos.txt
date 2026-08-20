@@ -3,4 +3,3 @@ demucs==4.0.1
 openai-whisper==20250625
 torch>=2.6,<3
 torchaudio>=2.6,<3
-torchcodec>=0.16,<1
